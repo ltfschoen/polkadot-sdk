@@ -95,7 +95,7 @@ cargo build -r -p test-parachain-adder-collator
 
 ## 📚 Documentation
 
-* [🦀 rust-docs]([paritytech.github.io/](https://paritytech.github.io/polkadot-sdk/master/polkadot_sdk_docs/index.html))
+* [🦀 rust-docs](https://paritytech.github.io/polkadot-sdk/master/polkadot_sdk_docs/index.html)
  * [Introduction](https://paritytech.github.io/polkadot-sdk/master/polkadot_sdk_docs/polkadot_sdk/index.html)
    to each component of the Polkadot SDK: Substrate, FRAME, Cumulus, and XCM
 * Other Resources:
@@ -153,3 +153,7 @@ fellowship, this separation, the RFC process
 This repository is the amalgamation of 3 separate repositories that used to make up Polkadot SDK,
 namely Substrate, Polkadot and Cumulus. Read more about the merge and its history
 [here](https://polkadot-public.notion.site/Polkadot-SDK-FAQ-fbc4cecc2c46443fb37b9eeec2f0d85f).
+
+## Other useful resources and tooling
+
+* A simple tool to manage and update the Polkadot SDK dependencies (https://github.com/paritytech/psvm)
