@@ -21,6 +21,78 @@ forks](https://img.shields.io/github/forks/paritytech/polkadot-sdk)
 
 </div>
 
+## Coretime
+
+* Fork Polkadot-SDK
+* Clone
+```
+git clone https://github.com/ltfschoen/polkadot-sdk
+cd polkadot-sdk
+```
+
+### Docker
+
+* Use 
+```
+git fetch origin fix-2750-substrate-docker-file:fix-2750-substrate-docker-file
+git checkout fix-2750-substrate-docker-file
+```
+* Follow instructions at https://github.com/ltfschoen/polkadot-sdk/blob/master/substrate/docker/README.md
+* Install and run Docker
+
+### Non-Docker
+
+#### MacOS
+
+#### Install dependencies
+Reference: https://guide.kusama.network/docs/build-guides-install-deps
+
+```bash
+brew install protobuf
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
+brew --version
+brew update
+brew install openssl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+rustup toolchain install nightly
+rustup default stable
+rustup update
+rustup update nightly
+rustup target add wasm32-unknown-unknown
+rustup target add wasm32-unknown-unknown --toolchain nightly
+```
+
+#### Get latest version of Polkadot SDK
+
+##### Using Polkadot SDK source in fork
+```
+git checkout master
+git remote add upstream https://github.com/paritytech/polkadot-sdk
+git pull --rebase upstream master
+cargo build -r -p test-parachain-adder-collator
+```
+
+##### Using separate app
+
+```bash
+export LATEST_RELEASE=$(curl --silent -qI https://github.com/paritytech/polkadot-sdk/releases/latest |
+  awk -F '/' '/^location/ {print  substr($NF, 1, length($NF)-1)}');
+echo "latest release $LATEST_RELEASE"
+git clone --branch ${LATEST_RELEASE} https://github.com/paritytech/polkadot-sdk
+cd polkadot-sdk
+cargo build --release
+cargo build -r -p test-parachain-adder-collator
+```
+
+### Links
+
+* awesome-substrate
+* coretime presentations
+* pba online
+* polkadot wiki
+* subalfred key to list all accounts associated with coretime chain
+
 ## 📚 Documentation
 
 * [🦀 rust-docs]([paritytech.github.io/](https://paritytech.github.io/polkadot-sdk/master/polkadot_sdk_docs/index.html))
