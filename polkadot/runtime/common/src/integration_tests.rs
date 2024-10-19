@@ -24,6 +24,7 @@ use crate::{
 	slots,
 	traits::{AuctionStatus, Auctioneer, Leaser, Registrar as RegistrarT},
 };
+use alloc::sync::Arc;
 use codec::Encode;
 use frame_support::{
 	assert_noop, assert_ok, derive_impl, parameter_types,
@@ -50,7 +51,6 @@ use sp_runtime::{
 	transaction_validity::TransactionPriority,
 	AccountId32, BuildStorage, MultiSignature,
 };
-use sp_std::sync::Arc;
 
 type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<Test>;
 type Block = frame_system::mocking::MockBlockU32<Test>;
@@ -98,12 +98,21 @@ frame_support::construct_runtime!(
 	}
 );
 
-impl<C> frame_system::offchain::SendTransactionTypes<C> for Test
+impl<C> frame_system::offchain::CreateTransactionBase<C> for Test
 where
 	RuntimeCall: From<C>,
 {
 	type Extrinsic = UncheckedExtrinsic;
-	type OverarchingCall = RuntimeCall;
+	type RuntimeCall = RuntimeCall;
+}
+
+impl<C> frame_system::offchain::CreateInherent<C> for Test
+where
+	RuntimeCall: From<C>,
+{
+	fn create_inherent(call: Self::RuntimeCall) -> Self::Extrinsic {
+		UncheckedExtrinsic::new_bare(call)
+	}
 }
 
 use crate::{auctions::Error as AuctionsError, crowdloan::Error as CrowdloanError};
@@ -173,23 +182,12 @@ impl pallet_timestamp::Config for Test {
 
 parameter_types! {
 	pub static ExistentialDeposit: Balance = 1;
-	pub const MaxReserves: u32 = 50;
 }
-
+#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
-	type MaxLocks = ();
 	type Balance = Balance;
-	type RuntimeEvent = RuntimeEvent;
-	type DustRemoval = ();
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
-	type WeightInfo = ();
-	type MaxReserves = MaxReserves;
-	type ReserveIdentifier = [u8; 8];
-	type RuntimeHoldReason = RuntimeHoldReason;
-	type RuntimeFreezeReason = RuntimeFreezeReason;
-	type FreezeIdentifier = ();
-	type MaxFreezes = ConstU32<0>;
 }
 
 impl configuration::Config for Test {

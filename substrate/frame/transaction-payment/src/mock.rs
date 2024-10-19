@@ -21,7 +21,7 @@ use frame_support::{
 	derive_impl,
 	dispatch::DispatchClass,
 	parameter_types,
-	traits::{fungible, ConstU64, Imbalance, OnUnbalanced},
+	traits::{fungible, Imbalance, OnUnbalanced},
 	weights::{Weight, WeightToFee as WeightToFeeT},
 };
 use frame_system as system;
@@ -73,20 +73,9 @@ impl frame_system::Config for Runtime {
 	type AccountData = pallet_balances::AccountData<Self::AccountId>;
 }
 
+#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Runtime {
-	type Balance = u64;
-	type RuntimeEvent = RuntimeEvent;
-	type DustRemoval = ();
-	type ExistentialDeposit = ConstU64<1>;
 	type AccountStore = System;
-	type MaxLocks = ();
-	type MaxReserves = ();
-	type ReserveIdentifier = [u8; 8];
-	type WeightInfo = ();
-	type FreezeIdentifier = ();
-	type MaxFreezes = ();
-	type RuntimeHoldReason = ();
-	type RuntimeFreezeReason = ();
 }
 
 impl WeightToFeeT for WeightToFee {
@@ -116,7 +105,7 @@ pub struct DealWithFees;
 impl OnUnbalanced<fungible::Credit<<Runtime as frame_system::Config>::AccountId, Balances>>
 	for DealWithFees
 {
-	fn on_unbalanceds<B>(
+	fn on_unbalanceds(
 		mut fees_then_tips: impl Iterator<
 			Item = fungible::Credit<<Runtime as frame_system::Config>::AccountId, Balances>,
 		>,
@@ -130,6 +119,15 @@ impl OnUnbalanced<fungible::Credit<<Runtime as frame_system::Config>::AccountId,
 	}
 }
 
+/// Weights used in testing.
+pub struct MockWeights;
+
+impl WeightInfo for MockWeights {
+	fn charge_transaction_payment() -> Weight {
+		Weight::from_parts(10, 0)
+	}
+}
+
 impl Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type OnChargeTransaction = FungibleAdapter<Balances, DealWithFees>;
@@ -137,4 +135,14 @@ impl Config for Runtime {
 	type WeightToFee = WeightToFee;
 	type LengthToFee = TransactionByteFee;
 	type FeeMultiplierUpdate = ();
+	type WeightInfo = MockWeights;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub fn new_test_ext() -> sp_io::TestExternalities {
+	crate::tests::ExtBuilder::default()
+		.base_weight(Weight::from_parts(100, 0))
+		.byte_fee(10)
+		.balance_factor(0)
+		.build()
 }

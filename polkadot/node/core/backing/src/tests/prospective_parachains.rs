@@ -212,6 +212,26 @@ async fn activate_leaf(
 				tx.send(Ok(Vec::new())).unwrap();
 			}
 		);
+
+		assert_matches!(
+			virtual_overseer.recv().await,
+			AllMessages::RuntimeApi(
+				RuntimeApiMessage::Request(parent, RuntimeApiRequest::Version(tx))
+			) if parent == hash => {
+				tx.send(Ok(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)).unwrap();
+			}
+		);
+
+		assert_matches!(
+			virtual_overseer.recv().await,
+			AllMessages::RuntimeApi(
+				RuntimeApiMessage::Request(parent, RuntimeApiRequest::ClaimQueue(tx))
+			) if parent == hash => {
+				tx.send(Ok(
+					test_state.claim_queue.clone()
+				)).unwrap();
+			}
+		);
 	}
 }
 
@@ -256,7 +276,7 @@ async fn assert_validate_seconded_candidate(
 			&validation_code == assert_validation_code &&
 			&*pov == assert_pov &&
 			&candidate_receipt.descriptor == candidate.descriptor() &&
-			exec_kind == PvfExecKind::Backing &&
+			exec_kind == PvfExecKind::BackingSystemParas &&
 			candidate.commitments.hash() == candidate_receipt.commitments_hash =>
 		{
 			response_sender.send(Ok(ValidationResult::Valid(
