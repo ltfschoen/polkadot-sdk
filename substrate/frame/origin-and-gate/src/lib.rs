@@ -28,12 +28,8 @@ use frame_support::{
 		ClassifyDispatch, DispatchClass, DispatchResult, GetDispatchInfo, Pays, PaysFee, WeighData,
 	},
 	pallet_prelude::*,
-	traits::IsSubType,
+	traits::{EnsureOrigin, Get, IsSubType},
 	weights::Weight,
-};
-use frame_support::{
-	pallet_prelude::*,
-	traits::{EnsureOrigin, Get},
 };
 use frame_system::{self, pallet_prelude::*};
 use frame_system::{ensure_signed, pallet_prelude::BlockNumberFor};
@@ -52,6 +48,8 @@ pub use pallet::*;
 
 #[cfg(test)]
 mod mock;
+#[cfg(test)]
+pub use mock::*;
 
 #[cfg(test)]
 mod tests;

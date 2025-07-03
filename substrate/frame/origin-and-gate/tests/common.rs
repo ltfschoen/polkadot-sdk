@@ -15,18 +15,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Conditional imports for different contexts
-#[cfg(test)]
-use crate as pallet_origin_and_gate; // For unit tests (within same crate)
-#[cfg(not(test))]
-extern crate pallet_origin_and_gate; // For integration tests (in ../tests folder)
+//! Common test utilities for integration tests.
 
 // Import pallet types directly
-use pallet_origin_and_gate::{AndGate, Call, Config, Dummy, Error, Event, ProposalStatus, Proposals, Approvals};
+use pallet_origin_and_gate::{self, AndGate, Config, Error, Event, HasOriginType, ProposalStatus, Proposals, Approvals};
 use frame_support::{
 	assert_ok, assert_noop, derive_impl, parameter_types,
-	traits::{ConstU32, ConstU64, EnsureOrigin, Everything},
-	pallet_prelude::*,
+	traits::{ConstU32, ConstU64, EnsureOrigin, Everything}
 };
 use frame_system::{self as system, RawOrigin};
 use sp_core::H256;
@@ -35,11 +30,16 @@ use sp_runtime::{
 	BuildStorage, Perbill,
 };
 
+// Define the same types used in the mock module
 type Block = frame_system::mocking::MockBlock<Test>;
 pub type AccountId = u64;
 pub type BlockNumber = u64;
 
 // Custom origins for testing
+pub const ALICE: u64 = 1;
+pub const BOB: u64 = 2;
+
+// Custom origin type enum
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CustomOriginType {
 	Alice,
@@ -53,16 +53,10 @@ impl Default for CustomOriginType {
 	}
 }
 
-// Custom origins for testing
-pub const ALICE: AccountId = 1;
-pub const BOB: AccountId = 2;
-pub const CHARLIE: AccountId = 3;
-
 // Origin identifiers
-pub const ALICE_ORIGIN_ID: u8 = 1;
-pub const BOB_ORIGIN_ID: u8 = 2;
-pub const CHARLIE_ORIGIN_ID: u8 = 3;
-pub const ROOT_ORIGIN_ID: u8 = 0;
+pub const ALICE_ORIGIN_ID: u8 = 10;
+pub const BOB_ORIGIN_ID: u8 = 20;
+pub const REQUIRED_APPROVALS: u32 = 2;
 
 // Custom origin checks if sender is Alice
 pub struct AliceOrigin;
@@ -203,172 +197,12 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 	ext
 }
 
-
-/// Helper function to create a dummy call that can be used for testing
-fn create_dummy_call(value: u64) -> Box<<Test as Config>::RuntimeCall> {
-	let call = Call::<Test>::set_dummy { new_value: value };
-	Box::new(RuntimeCall::OriginAndGate(call))
-}
-
-#[test]
-fn set_dummy_works() {
-	new_test_ext().execute_with(|| {
-		// Check initial value is None
-		assert_eq!(Dummy::<Test>::get(), None);
-
-		// Set dummy value
-		assert_ok!(OriginAndGate::set_dummy(RuntimeOrigin::root(), 42));
-
-		// Check value was set
-		assert_eq!(Dummy::<Test>::get(), Some(42));
-
-		// Set new value
-		assert_ok!(OriginAndGate::set_dummy(RuntimeOrigin::root(), 100));
-
-		// Check value was updated
-		assert_eq!(Dummy::<Test>::get(), Some(100));
-	});
-}
-
-#[test]
-fn set_dummy_fails_with_bad_origin() {
-	new_test_ext().execute_with(|| {
-		// Attempt to set with signed origin should fail
-		assert_noop!(
-			OriginAndGate::set_dummy(RuntimeOrigin::signed(1), 42),
-			DispatchError::BadOrigin
-		);
-	});
-}
-
-#[test]
-fn propose_creates_new_proposal() {
-	new_test_ext().execute_with(|| {
-		System::set_block_number(1);
-
-		// Create a call
-		let call = create_dummy_call(42);
-		let call_hash = <<Test as Config>::Hashing as sp_runtime::traits::Hash>::hash_of(&call);
-
-		// Propose using Alice's origin
-		assert_ok!(OriginAndGate::propose(
-			RuntimeOrigin::signed(ALICE),
-			call,
-			ALICE_ORIGIN_ID,
-			None,
-		));
-
-		// Verify proposal was stored
-		let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
-		assert_eq!(proposal.status, ProposalStatus::Pending);
-		assert_eq!(proposal.approvals.len(), 1);
-		assert_eq!(proposal.approvals[0], ALICE_ORIGIN_ID);
-
-		// Verify event was emitted
-		System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalCreated {
-			proposal_hash: call_hash,
-			origin_id: ALICE_ORIGIN_ID,
-		}));
-	});
-}
-
-#[test]
-fn approve_adds_approval() {
-	new_test_ext().execute_with(|| {
-		System::set_block_number(1);
-
-		// Create a call
-		let call = create_dummy_call(42);
-		let call_hash = <<Test as Config>::Hashing as sp_runtime::traits::Hash>::hash_of(&call);
-
-		// Propose using Alice's origin
-		assert_ok!(OriginAndGate::propose(
-			RuntimeOrigin::signed(ALICE),
-			call,
-			ALICE_ORIGIN_ID,
-			None,
-		));
-
-		// Approve using Bob's origin
-		assert_ok!(OriginAndGate::approve(
-			RuntimeOrigin::signed(BOB),
-			call_hash,
-			ALICE_ORIGIN_ID,
-			BOB_ORIGIN_ID,
-		));
-
-		// Verify approval was added
-		let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
-		assert_eq!(proposal.approvals.len(), 2);
-		assert!(proposal.approvals.contains(&BOB_ORIGIN_ID));
-
-		// Verify event was emitted
-		System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalApproved {
-			proposal_hash: call_hash,
-			origin_id: ALICE_ORIGIN_ID,
-			approving_origin_id: BOB_ORIGIN_ID,
-		}));
-	});
-}
-
-#[test]
-fn duplicate_approval_fails() {
-	new_test_ext().execute_with(|| {
-		System::set_block_number(1);
-
-		// Create a call
-		let call = create_dummy_call(42);
-		let call_hash = <<Test as Config>::Hashing as sp_runtime::traits::Hash>::hash_of(&call);
-
-		// Propose using Alice's origin
-		assert_ok!(OriginAndGate::propose(
-			RuntimeOrigin::signed(ALICE),
-			call,
-			ALICE_ORIGIN_ID,
-			None,
-		));
-
-		// Try to approve again with the same origin
-		assert_noop!(
-			OriginAndGate::approve(
-				RuntimeOrigin::signed(ALICE),
-				call_hash,
-				ALICE_ORIGIN_ID,
-				ALICE_ORIGIN_ID,
-			),
-			Error::<Test>::AlreadyApproved
-		);
-	});
-}
-
-#[test]
-fn approve_non_existent_proposal_fails() {
-	new_test_ext().execute_with(|| {
-		// Create a non-existent call hash
-		let call_hash = H256::repeat_byte(0xab);
-
-		// Try to approve a non-existent proposal
-		assert_noop!(
-			OriginAndGate::approve(
-				RuntimeOrigin::signed(BOB),
-				call_hash,
-				ALICE_ORIGIN_ID,
-				BOB_ORIGIN_ID,
-			),
-			Error::<Test>::ProposalNotFound
-		);
-	});
-}
-
-#[test]
-fn ensure_origin_trait_implementation_works() {
-	new_test_ext().execute_with(|| {
-		// Direct use of AndGate should fail for any single origin
-		assert!(AliceAndBob::ensure_origin(RuntimeOrigin::signed(ALICE)).is_err());
-		assert!(AliceAndBob::ensure_origin(RuntimeOrigin::signed(BOB)).is_err());
-		assert!(AliceAndBob::ensure_origin(RuntimeOrigin::root()).is_err());
-
-		// We rely on integration tests to verify full approval workflow
-		// This unit test just verifies the trait implementation works as expected
-	});
+/// Helper function to create a remark call that can be used for testing
+pub fn make_remark_call(text: &str) -> Result<Box<RuntimeCall>, &'static str> {
+	let value = match text.parse::<u64>() {
+		Ok(v) => v,
+		Err(_) => return Err("Failed to parse input as u64"),
+	};
+	let remark = pallet_origin_and_gate::Call::<Test>::set_dummy { new_value: value };
+	Ok(Box::new(RuntimeCall::OriginAndGate(remark)))
 }
