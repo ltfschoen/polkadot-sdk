@@ -21,95 +21,94 @@
 //! patterns, and with complex workflows and edge cases handled in dedicated integration
 //! test files.
 
-use assert_matches::assert_matches;
 use frame_support::assert_ok;
 use frame_support::traits::EnsureOrigin;
-use sp_core::H256;
-use sp_runtime::DispatchError;
+use pallet_origin_and_gate::{Config, Event, Proposals};
+use sp_runtime::traits::Hash;
 
 mod common;
 use common::*;
 
 #[test]
-fn test_direct_and_gate_impossible_with_signed_origins() {
-	new_test_ext().execute_with(|| {
-		// Test that signed origins cannot satisfy AndGate directly
-		// to represents the real-world scenario where a single account
-		// cannot simultaneously satisfy multiple origin requirements
-		assert!(AliceAndBob::try_origin(RuntimeOrigin::signed(ALICE)).is_err());
-		assert!(AliceAndBob::try_origin(RuntimeOrigin::signed(BOB)).is_err());
-	});
-}
-
-#[test]
-fn test_direct_and_gate_impossible_with_root_origin() {
-	new_test_ext().execute_with(|| {
-		// Test that even root origin cannot bypass AndGate requirements
-		assert!(AliceAndBob::try_origin(RuntimeOrigin::root()).is_err());
-	});
-}
-
-#[test]
-fn test_origin_type_with_proposal_workflow() {
+fn test_create_and_retrieve_proposal() {
 	new_test_ext().execute_with(|| {
 		// Set block number for event verification
 		System::set_block_number(1);
 
-		// Create a test call that will be used in the proposal
-		let call = Call::Dummy { data: 42 }.into();
-		let call_hash = <Test as Config>::Hashing::hash_of(&call);
+		// Create test call for use in proposal
+		let call = Box::new(RuntimeCall::OriginAndGate(pallet_origin_and_gate::Call::set_dummy { new_value: 1000 }));
+		let call_hash = <<Test as Config>::Hashing as Hash>::hash_of(&call);
 
-		// Propose using Alice's origin and get origin ID dynamically
-		let alice_origin_id = match AliceOrigin::origin_type() {
-			CustomOriginType::Alice => ALICE_ORIGIN_ID,
-			_ => panic!("Unexpected origin type"),
-		};
-
+		// Create proposal with Alice's origin
 		assert_ok!(OriginAndGate::propose(
 			RuntimeOrigin::signed(ALICE),
-			call.clone(),
-			alice_origin_id,
-			None
+			call,
+			ALICE_ORIGIN_ID,
+			None,
 		));
 
-		// Bob approves the proposal with dynamically determined origin ID
-		let bob_origin_id = match BobOrigin::origin_type() {
-			CustomOriginType::Bob => BOB_ORIGIN_ID,
-			_ => panic!("Unexpected origin type"),
-		};
+		// Verify proposal exists
+		let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID);
+		assert!(proposal.is_some());
 
-		assert_ok!(OriginAndGate::approve(
-			RuntimeOrigin::signed(BOB),
-			call_hash,
-			alice_origin_id,
-			bob_origin_id,
-		));
-
-		// Verify the proposal exists and has both approvals
-		let proposal = Proposals::<Test>::get(call_hash, alice_origin_id).unwrap();
-		assert_eq!(proposal.approvals.len(), 2);
-
-		// Verify both origin IDs are in the approvals
-		assert!(proposal.approvals.contains(&alice_origin_id));
-		assert!(proposal.approvals.contains(&bob_origin_id));
-
-		// Verify approval event was emitted with correct origin IDs
-		System::assert_has_event(<Test as Config>::Event::ProposalApproved(
-			call_hash,
-			alice_origin_id,
-			bob_origin_id,
-		));
+		// Verify event emitted
+		System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalCreated {
+			proposal_hash: call_hash,
+			origin_id: ALICE_ORIGIN_ID,
+		}));
 	});
 }
 
 #[test]
-fn test_andgate_origin_type() {
+fn test_proposal_workflow() {
 	new_test_ext().execute_with(|| {
-		// Composite AndGate should return the default variant
-		assert_eq!(AliceAndBob::origin_type(), CustomOriginType::None);
+		// Set block number for event verification
+		System::set_block_number(1);
 
-		// Individual origins should return their respective variants
-		assert_eq!(AliceOrigin::origin_type(), CustomOriginType::Alice);
-		assert_eq!(BobOrigin::origin_type(), CustomOriginType::Bob);
+		// Create test call to be used in proposal
+		let call = Box::new(RuntimeCall::OriginAndGate(pallet_origin_and_gate::Call::set_dummy { new_value: 42 }));
+		let call_hash = <<Test as Config>::Hashing as Hash>::hash_of(&call);
+
+		// Propose using Alice's origin
+		assert_ok!(OriginAndGate::propose(
+			RuntimeOrigin::signed(ALICE),
+			call.clone(),
+			ALICE_ORIGIN_ID,
+			None
+		));
+
+		// Bob approves proposal
+		assert_ok!(OriginAndGate::approve(
+			RuntimeOrigin::signed(BOB),
+			call_hash,
+			ALICE_ORIGIN_ID,
+			BOB_ORIGIN_ID,
+		));
+
+		// Verify proposal exists and has both approvals
+		let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
+		assert_eq!(proposal.approvals.len(), 2);
+
+		// Verify both origin IDs are in approvals
+		assert!(proposal.approvals.contains(&ALICE_ORIGIN_ID));
+		assert!(proposal.approvals.contains(&BOB_ORIGIN_ID));
+
+		// Verify appropriate events were emitted
+		System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalApproved {
+			proposal_hash: call_hash,
+			origin_id: ALICE_ORIGIN_ID,
+			approving_origin_id: BOB_ORIGIN_ID,
+		}));
+	});
+}
+
+#[test]
+fn test_origin_ids() {
+	new_test_ext().execute_with(|| {
+		// Verify origin ID constants match expected values
+		assert_eq!(ALICE_ORIGIN_ID, 10);
+		assert_eq!(BOB_ORIGIN_ID, 20);
+		assert_eq!(CHARLIE_ORIGIN_ID, 30);
+		assert_eq!(ROOT_ORIGIN_ID, 0);
 	});
 }

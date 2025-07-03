@@ -18,7 +18,7 @@
 //! Common test utilities for integration tests.
 
 // Import pallet types directly
-use pallet_origin_and_gate::{self, AndGate, Config, Error, Event, HasOriginType, ProposalStatus, Proposals, Approvals};
+use pallet_origin_and_gate::{self, AndGate, Config, Error, Event, ProposalStatus, Proposals, Approvals};
 use frame_support::{
 	assert_ok, assert_noop, derive_impl, parameter_types,
 	traits::{ConstU32, ConstU64, EnsureOrigin, Everything}
@@ -38,6 +38,9 @@ pub type BlockNumber = u64;
 // Custom origins for testing
 pub const ALICE: u64 = 1;
 pub const BOB: u64 = 2;
+pub const CHARLIE: u64 = 3;
+pub const ROOT: u64 = 0;
+
 
 // Custom origin type enum
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +59,8 @@ impl Default for CustomOriginType {
 // Origin identifiers
 pub const ALICE_ORIGIN_ID: u8 = 10;
 pub const BOB_ORIGIN_ID: u8 = 20;
+pub const CHARLIE_ORIGIN_ID: u8 = 30;
+pub const ROOT_ORIGIN_ID: u8 = 0;
 pub const REQUIRED_APPROVALS: u32 = 2;
 
 // Custom origin checks if sender is Alice
