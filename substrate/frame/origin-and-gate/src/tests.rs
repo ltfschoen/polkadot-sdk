@@ -30,6 +30,19 @@ use sp_runtime::{
 mod mock;
 pub use mock::*;
 
+/// Helper functions for RuntimeOrigin to maintain function-style syntax
+impl RuntimeOrigin {
+    /// Create a signed origin from an account ID
+    pub fn signed(who: AccountId) -> Self {
+        RawOrigin::Signed(who).into()
+    }
+
+    /// Create a root origin
+    pub fn root() -> Self {
+        RawOrigin::Root.into()
+    }
+}
+
 /// Helper function to create remark call for use with testing
 fn make_remark_call(text: &str) -> Result<Box<<Test as Config>::RuntimeCall>, &'static str> {
 	// Try parse text as u64
@@ -313,7 +326,7 @@ mod unit_test {
 		}
 
 		#[test]
-		fn proposal_cancellation_cleans_up_all_storage() {
+		fn proposal_cancellation_removes_all_storage() {
 			new_test_ext().execute_with(|| {
 				System::set_block_number(1);
 
@@ -354,7 +367,7 @@ mod unit_test {
 				// Verify proposal calls no longer exists
 				assert!(!ProposalCalls::<Test>::contains_key(call_hash));
 
-				// Verify approvals storage is also cleaned up
+				// Verify approvals storage is also removed
 				assert!(
 					Approvals::<Test>::get((call_hash, ALICE_ORIGIN_ID), ALICE_ORIGIN_ID).is_none()
 				);
@@ -391,7 +404,7 @@ mod unit_test {
 					ALICE_ORIGIN_ID,
 				));
 
-				// Verify all storage is cleaned up after cancellation
+				// Verify all storage is removed after cancellation
 				assert!(!Proposals::<Test>::contains_key(call_hash, ALICE_ORIGIN_ID));
 				assert!(!ProposalCalls::<Test>::contains_key(call_hash));
 				assert!(
@@ -442,7 +455,7 @@ mod unit_test {
 				));
 
 				// Create proposal info with sufficient approvals and executed status
-				let mut approvals = BoundedVec::<u8, MaxApprovals>::default();
+				let mut approvals = BoundedVec::default();
 				approvals.try_push(ALICE_ORIGIN_ID.into()).unwrap();
 				approvals.try_push(BOB_ORIGIN_ID.into()).unwrap(); // Already have 2 approvals
 
@@ -512,7 +525,8 @@ mod unit_test {
 				System::assert_has_event(RuntimeEvent::OriginAndGate(Event::OriginApprovalAdded {
 					proposal_hash: call_hash,
 					origin_id: ALICE_ORIGIN_ID,
-					approving_origin_id: BOB_ORIGIN_ID,
+					approval_origin_id: BOB_ORIGIN_ID,
+					who: BOB,
 				}));
 			});
 		}
@@ -637,7 +651,7 @@ mod unit_test {
 				let expiry = Some(starting_block + <Test as Config>::ProposalLifetime::get());
 
 				// Manually create and insert proposal but with empty `approvals`
-				// without the proposer automatically approving that normally occurs.
+				// without the proposer automatical approval that normally occurs.
 				// Instead delay that to occur later
 				let approvals = BoundedVec::default();
 
@@ -1047,6 +1061,303 @@ mod unit_test {
 			});
 		}
 	}
+
+	mod remove_proposal {
+		use super::*;
+
+		#[test]
+		fn remove_by_proposer_removes_expired_proposal() {
+			new_test_ext().execute_with(|| {
+				let starting_block = 1;
+				System::set_block_number(starting_block);
+
+				let call = make_remark_call("1000").unwrap();
+				let call_hash = <Test as Config>::Hashing::hash_of(&call);
+				// Expire after ProposalLifetime blocks
+				let expiry = Some(starting_block + <Test as Config>::ProposalLifetime::get());
+
+				// Create proposal
+				assert_ok!(OriginAndGate::propose(
+					RuntimeOrigin::signed(ALICE),
+					call.clone(),
+					ALICE_ORIGIN_ID,
+					expiry,
+				));
+
+				// Advance past expiry
+				System::set_block_number(expiry.unwrap() + 1);
+
+				// Try approve after expiry to mark proposal as expired
+				assert_noop!(
+					OriginAndGate::add_approval(
+						RuntimeOrigin::signed(BOB),
+						call_hash,
+						ALICE_ORIGIN_ID,
+						BOB_ORIGIN_ID,
+					),
+					Error::<Test>::ProposalExpired
+				);
+
+				// Verify proposal marked expired
+				let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
+				assert_eq!(proposal.status, ProposalStatus::Expired);
+
+				// Remove expired proposal
+				assert_ok!(OriginAndGate::remove(
+					RuntimeOrigin::signed(ALICE),
+					call_hash,
+					ALICE_ORIGIN_ID,
+				));
+
+				// Verify proposal removed from storage
+				assert!(!Proposals::<Test>::contains_key(call_hash, ALICE_ORIGIN_ID));
+				assert!(!ProposalCalls::<Test>::contains_key(call_hash));
+
+				// Check event emitted
+				System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalRemoved {
+					proposal_hash: call_hash,
+					origin_id: ALICE_ORIGIN_ID,
+					who: ALICE,
+				}));
+			});
+		}
+
+		#[test]
+		fn remove_by_governance_works_removes_expired_proposal() {
+			new_test_ext().execute_with(|| {
+				let starting_block = 1;
+				System::set_block_number(starting_block);
+
+				let call = make_remark_call("1000").unwrap();
+				let call_hash = <Test as Config>::Hashing::hash_of(&call);
+				let expiry = Some(starting_block + <Test as Config>::ProposalLifetime::get());
+
+				// Create proposal
+				assert_ok!(OriginAndGate::propose(
+					RuntimeOrigin::signed(ALICE),
+					call.clone(),
+					ALICE_ORIGIN_ID,
+					expiry,
+				));
+
+				// Advance past expiry
+				System::set_block_number(expiry.unwrap() + 1);
+
+				// Try to approve to mark as expired
+				assert_noop!(
+					OriginAndGate::add_approval(
+						RuntimeOrigin::signed(BOB),
+						call_hash,
+						ALICE_ORIGIN_ID,
+						BOB_ORIGIN_ID,
+					),
+					Error::<Test>::ProposalExpired
+				);
+
+				// Verify proposal marked expired
+				let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
+				assert_eq!(proposal.status, ProposalStatus::Expired);
+
+				// Remove expired proposal using governance (root) origin
+				assert_ok!(OriginAndGate::remove(
+					RuntimeOrigin::root(),
+					call_hash,
+					ALICE_ORIGIN_ID,
+				));
+
+				// Verify proposal removed from storage
+				assert!(!Proposals::<Test>::contains_key(call_hash, ALICE_ORIGIN_ID));
+				assert!(!ProposalCalls::<Test>::contains_key(call_hash));
+
+				// Check event emitted
+				System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalRemoved {
+					proposal_hash: call_hash,
+					origin_id: ALICE_ORIGIN_ID,
+					who: 0, // Root account 0 in mock
+				}));
+			});
+		}
+
+		#[test]
+		fn remove_by_proposer_fails_for_non_expired_proposal() {
+			new_test_ext().execute_with(|| {
+				let starting_block = 1;
+				System::set_block_number(starting_block);
+
+				let call = make_remark_call("1000").unwrap();
+				let call_hash = <Test as Config>::Hashing::hash_of(&call);
+				let expiry = Some(starting_block + <Test as Config>::ProposalLifetime::get());
+
+				// Create proposal
+				assert_ok!(OriginAndGate::propose(
+					RuntimeOrigin::signed(ALICE),
+					call.clone(),
+					ALICE_ORIGIN_ID,
+					expiry,
+				));
+
+				// Try remove non-expired proposal
+				assert_noop!(
+					OriginAndGate::remove(RuntimeOrigin::signed(ALICE), call_hash, ALICE_ORIGIN_ID,),
+					Error::<Test>::ProposalNotExpired
+				);
+			});
+		}
+
+		#[test]
+		fn remove_by_proposer_fails_for_executed_proposal() {
+			new_test_ext().execute_with(|| {
+				// Create and execute proposal
+				let call = make_remark_call("1000").unwrap();
+				let call_hash = <Test as Config>::Hashing::hash_of(&call);
+
+				// Create proposal
+				assert_ok!(OriginAndGate::propose(
+					RuntimeOrigin::signed(ALICE),
+					call.clone(),
+					ALICE_ORIGIN_ID,
+					None,
+				));
+
+				// Bob approves and executes
+				assert_ok!(OriginAndGate::add_approval(
+					RuntimeOrigin::signed(BOB),
+					call_hash,
+					ALICE_ORIGIN_ID,
+					BOB_ORIGIN_ID,
+				));
+
+				// Verify proposal executed
+				let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
+				assert_eq!(proposal.status, ProposalStatus::Executed);
+
+				// Try remove executed proposal
+				assert_noop!(
+					OriginAndGate::remove(RuntimeOrigin::signed(ALICE), call_hash, ALICE_ORIGIN_ID,),
+					Error::<Test>::ProposalNotExpired
+				);
+			});
+		}
+
+		#[test]
+		fn remove_fails_for_unauthorised_caller() {
+			new_test_ext().execute_with(|| {
+				let starting_block = 1;
+				System::set_block_number(starting_block);
+
+				let call = make_remark_call("1000").unwrap();
+				let call_hash = <Test as Config>::Hashing::hash_of(&call);
+				let expiry = Some(starting_block + <Test as Config>::ProposalLifetime::get());
+
+				// Create proposal
+				assert_ok!(OriginAndGate::propose(
+					RuntimeOrigin::signed(ALICE),
+					call.clone(),
+					ALICE_ORIGIN_ID,
+					expiry,
+				));
+
+				// Advance past expiry
+				System::set_block_number(expiry.unwrap() + 1);
+
+				// Try approve mark expired
+				assert_noop!(
+					OriginAndGate::add_approval(
+						RuntimeOrigin::signed(BOB),
+						call_hash,
+						ALICE_ORIGIN_ID,
+						BOB_ORIGIN_ID,
+					),
+					Error::<Test>::ProposalExpired
+				);
+
+				// Verify proposal marked expired
+				let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
+				assert_eq!(proposal.status, ProposalStatus::Expired);
+
+				// Try remove expired proposal as unauthorised user
+				assert_noop!(
+					OriginAndGate::remove(
+						RuntimeOrigin::signed(CHARLIE),
+						call_hash,
+						ALICE_ORIGIN_ID,
+					),
+					Error::<Test>::NotAuthorized
+				);
+			});
+		}
+
+		#[test]
+		fn remove_fails_for_nonexistent_proposal() {
+			new_test_ext().execute_with(|| {
+				let call = make_remark_call("1000").unwrap();
+				let call_hash = <Test as Config>::Hashing::hash_of(&call);
+
+				// Try remove nonexistent proposal
+				assert_noop!(
+					OriginAndGate::remove(RuntimeOrigin::signed(ALICE), call_hash, ALICE_ORIGIN_ID,),
+					Error::<Test>::ProposalNotFound
+				);
+			});
+		}
+	}
+
+	mod expired_proposal {
+		use super::*;
+
+		#[test]
+		fn proposal_automatically_marked_expired() {
+			new_test_ext().execute_with(|| {
+				// Setup
+				let starting_block = 1;
+				System::set_block_number(starting_block);
+
+				// Create proposal with expiry
+				let call = make_remark_call("1000").unwrap();
+				let call_hash = <Test as Config>::Hashing::hash_of(&call);
+				let expiry = Some(starting_block + <Test as Config>::ProposalLifetime::get());
+
+				assert_ok!(OriginAndGate::propose(
+					RuntimeOrigin::signed(ALICE),
+					call.clone(),
+					ALICE_ORIGIN_ID,
+					expiry,
+				));
+
+				// Verify initial status is Pending
+				let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
+				assert_eq!(proposal.status, ProposalStatus::Pending);
+
+				// Advance past expiry
+				System::set_block_number(expiry.unwrap() + 1);
+
+				// Try to approve should trigger expiry check
+				assert_noop!(
+					OriginAndGate::add_approval(
+						RuntimeOrigin::signed(BOB),
+						call_hash,
+						ALICE_ORIGIN_ID,
+						BOB_ORIGIN_ID,
+					),
+					Error::<Test>::ProposalExpired
+				);
+
+				// Verify status now Expired in storage
+				let proposal = Proposals::<Test>::get(call_hash, ALICE_ORIGIN_ID).unwrap();
+				assert_eq!(proposal.status, ProposalStatus::Expired);
+
+				// Try removing expired proposal
+				assert_ok!(OriginAndGate::remove(
+					RuntimeOrigin::signed(ALICE),
+					call_hash,
+					ALICE_ORIGIN_ID,
+				));
+
+				// Verify proposal removed
+				assert!(!Proposals::<Test>::contains_key(call_hash, ALICE_ORIGIN_ID));
+			});
+		}
+	}
 }
 
 /// Integration tests for origin-and-gate pallet focusing on verifying end-to-end
@@ -1133,7 +1444,8 @@ mod integration_test {
 			System::assert_has_event(RuntimeEvent::OriginAndGate(Event::OriginApprovalAdded {
 				proposal_hash: call_hash,
 				origin_id: alice_origin_id,
-				approving_origin_id: bob_origin_id,
+				approval_origin_id: bob_origin_id,
+				who: BOB,
 			}));
 		});
 	}
@@ -1237,7 +1549,7 @@ mod integration_test {
 					None,
 				));
 
-				// Try to approve with same origin ID and Alice approving should fail
+				// Try to approve with same origin ID and Alice approval should fail
 				let result = OriginAndGate::add_approval(
 					RuntimeOrigin::signed(ALICE),
 					call_hash,
@@ -1246,7 +1558,7 @@ mod integration_test {
 				);
 				assert!(result.is_err());
 
-				// Try to approve with same origin ID and Bob approving should fail
+				// Try to approve with same origin ID and Bob approval should fail
 				let result = OriginAndGate::add_approval(
 					RuntimeOrigin::signed(BOB),
 					call_hash,
@@ -1384,8 +1696,12 @@ mod integration_test {
 				let events = System::events();
 				assert!(events.iter().any(|record| matches!(
 					record.event,
-					mock::RuntimeEvent::OriginAndGate(Event::OriginApprovalAdded { proposal_hash, .. })
-					if proposal_hash == call_hash
+					mock::RuntimeEvent::OriginAndGate(Event::OriginApprovalAdded {
+						proposal_hash: call_hash,
+						origin_id: ALICE_ORIGIN_ID,
+						approval_origin_id: BOB_ORIGIN_ID,
+						who: BOB,
+					})
 				)));
 
 				assert!(events.iter().any(|record| matches!(
@@ -1442,7 +1758,7 @@ mod integration_test {
 				// Ensure any error type other than `InsufficientApprovals` is propagated.
 				// Extract inner error from DispatchErrorWithPostInfo
 				if let Err(err) = result {
-					let dispatch_error = &err.error;
+					let dispatch_error = &err;
 					if let DispatchError::Module(module_error) = dispatch_error {
 						// Get pallet index for `OriginAndGate` that is usually
 						// Substrate default of 42 for test pallets

@@ -112,6 +112,21 @@ impl EnsureOrigin<RuntimeOrigin> for BobOrigin {
 	}
 }
 
+// Root origin as governance origin for testing
+pub struct EnsureRoot;
+impl EnsureOrigin<RuntimeOrigin> for EnsureRoot {
+	type Success = ();
+
+	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
+		<frame_system::EnsureRoot<AccountId>>::try_origin(o)
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn try_successful_origin() -> Result<RuntimeOrigin, ()> {
+		Ok(frame_system::RawOrigin::Root.into())
+	}
+}
+
 // Type aliases for origin wrappers for use in tests
 pub type SignedByAlice = frame_system::EnsureSignedBy<AliceOrigin, AccountId>;
 pub type SignedByBob = frame_system::EnsureSignedBy<BobOrigin, AccountId>;
@@ -199,6 +214,20 @@ impl pallet_origin_and_gate::Config for Test {
 	type OriginId = OriginId;
 	type ProposalLifetime = ProposalLifetime;
 	type WeightInfo = ();
+	type GovernanceOrigin = EnsureRoot;
+}
+
+// Helper functions for RuntimeOrigin to maintain function-style syntax
+impl RuntimeOrigin {
+	/// Create a signed origin from an account ID
+	pub fn signed(who: AccountId) -> Self {
+		RawOrigin::Signed(who).into()
+	}
+
+	/// Create a root origin
+	pub fn root() -> Self {
+		RawOrigin::Root.into()
+	}
 }
 
 // This function basically just builds a genesis storage key/value store according to

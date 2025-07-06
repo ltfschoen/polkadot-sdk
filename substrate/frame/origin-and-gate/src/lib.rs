@@ -34,6 +34,7 @@ use frame_support::{
 use frame_system::{
 	self, ensure_signed,
 	pallet_prelude::{BlockNumberFor, *},
+	Origin as RuntimeOrigin,
 };
 use log::info;
 use scale_info::TypeInfo;
@@ -100,7 +101,7 @@ where
 struct WeightForSetDummy<T: pallet_balances::Config>(BalanceOf<T>);
 
 impl<T: pallet_balances::Config> WeighData<(&BalanceOf<T>,)> for WeightForSetDummy<T> {
-	fn weigh_data(&self, target: (&BalanceOf<T>,)) -> Weight {
+	fn weigh_data(&self, _target: (&BalanceOf<T>,)) -> Weight {
 		Weight::from_parts(100_000, 0)
 	}
 }
@@ -154,6 +155,9 @@ pub mod pallet {
 
 		/// Weight information for extrinsics in this pallet.
 		type WeightInfo: WeightInfo;
+
+		/// Governance origin type.
+		type GovernanceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 	}
 
 	#[pallet::pallet]
@@ -185,57 +189,106 @@ pub mod pallet {
 				Error::NotAuthorized => 4,
 				Error::ProposalAlreadyExecuted => 5,
 				Error::ProposalExpired => 6,
-				Error::ProposalCancelled => 7,
-				Error::OriginAlreadyApproved => 8,
-				Error::InsufficientApprovals => 9,
-				Error::ProposalNotPending => 10,
-				Error::OriginApprovalNotFound => 11,
+				Error::ProposalNotExpired => 7,
+				Error::ProposalCancelled => 8,
+				Error::OriginAlreadyApproved => 9,
+				Error::InsufficientApprovals => 10,
+				Error::ProposalNotPending => 11,
+				Error::OriginApprovalNotFound => 12,
+				Error::FailedToExecute => 13,
 			}
 		}
 
-		/// Helper function to check if a proposal has sufficient approvals and execute it
-		fn check_and_execute_proposal(
-			proposal_hash: T::Hash,
-			origin_id: T::OriginId,
-			mut proposal_info: ProposalInfo<
-				T::Hash,
-				BlockNumberFor<T>,
-				T::OriginId,
-				T::AccountId,
-				T::MaxApprovals,
-			>,
-		) -> DispatchResult {
-			// Check for minimum number of approvals (customize this logic based on your
-			// requirements) Note that for the "AND Gate" pattern, we require a minimum of 2
-			// approvals
-			if proposal_info.approvals.len() >= T::MaxApprovals::get() as usize {
-				// Retrieve the actual call from storage
-				if let Some(call) = <ProposalCalls<T>>::get(proposal_hash) {
-					// Execute the call with root origin
-					let result = call.dispatch(frame_system::RawOrigin::Root.into());
+		/// Helper function to attempt execution of a proposal with sufficient approvals
+		fn maybe_execute(
+			proposal_hash: &T::Hash,
+			origin_id: &T::OriginId,
+			mut proposal: ProposalInfo<T::Hash, BlockNumberFor<T>, T::OriginId, T::AccountId, T::MaxApprovals>,
+		) -> Result<(), DispatchError> {
+			// Only attempt to execute if proposal is still Pending
+			if proposal.status != ProposalStatus::Pending {
+				return Ok(());
+			}
+
+			// Check if we have enough approvals
+			if proposal.approvals.len() as u32 >= T::MaxApprovals::get() {
+				// Create timepoint for this execution
+				let now = <frame_system::Pallet<T>>::block_number();
+				let current_timepoint = <CurrentTimepoint<T>>::get().unwrap_or(TimePoint {
+					height: BlockNumberFor::<T>::zero(),
+					index: 0
+				});
+				let index = current_timepoint.index + 1;
+				let time = TimePoint { height: now, index };
+
+				// Get the call that was stored
+				let maybe_call = <ProposalCalls<T>>::get(proposal_hash);
+				if let Some(call) = maybe_call {
+					// Store timepoint and update proposal
+					<CurrentTimepoint<T>>::put(time);
+					<ExecutedCalls<T>>::insert(time, *proposal_hash);
 
 					// Update proposal status
-					proposal_info.status = ProposalStatus::Executed;
-					<Proposals<T>>::insert(proposal_hash, origin_id, proposal_info);
+					proposal.status = ProposalStatus::Executed;
+					<Proposals<T>>::insert(proposal_hash, origin_id, proposal);
 
-					// Clean up call data since it's no longer needed
+					// Dispatch the call with root origin
+					let result = call.dispatch(RuntimeOrigin::root());
+
+					// Clean up approvals storage
+					<Approvals<T>>::remove_prefix((proposal_hash, origin_id.clone()), None);
+
+					// Clear call storage
 					<ProposalCalls<T>>::remove(proposal_hash);
 
-					// Emit event with the dispatch result
+					// Emit event for proposal execution
 					Self::deposit_event(Event::ProposalExecuted {
-						proposal_hash,
-						origin_id,
+						proposal_hash: *proposal_hash,
+						origin_id: origin_id.clone(),
 						result: result.map(|_| ()).map_err(|e| e.error),
 					});
 
-					return Ok(());
+					// Return result
+					if result.is_ok() {
+						Ok(())
+					} else {
+						Err(Error::<T>::FailedToExecute.into())
+					}
+				} else {
+					Ok(())
 				}
+			} else {
+				Ok(())
+			}
+		}
 
-				return Err(Error::<T>::ProposalNotFound.into());
+		/// Check if proposal expired and if so update its storage status
+		/// Returns true if expired, false otherwise
+		fn is_expired(
+			proposal_hash: &T::Hash,
+			origin_id: &T::OriginId,
+			proposal: &mut ProposalInfo<T::Hash, BlockNumberFor<T>, T::OriginId, T::AccountId, T::MaxApprovals>,
+		) -> bool {
+			if let Some(expiry) = proposal.expiry {
+				let current_block = <frame_system::Pallet<T>>::block_number();
+				if current_block > expiry {
+					// Update status in proposal info
+					proposal.status = ProposalStatus::Expired;
+
+					// Update proposal in storage
+					<Proposals<T>>::insert(proposal_hash, origin_id, proposal.clone());
+
+					// Emit expiry event
+					Self::deposit_event(Event::ProposalExpired {
+						proposal_hash: *proposal_hash,
+						origin_id: origin_id.clone(),
+					});
+
+					return true;
+				}
 			}
 
-			// Return an error when there aren't enough approvals
-			Err(Error::<T>::InsufficientApprovals.into())
+			false
 		}
 	}
 
@@ -320,58 +373,48 @@ pub mod pallet {
 		pub fn add_approval(
 			origin: OriginFor<T>,
 			call_hash: T::Hash,
-			origin_id: T::OriginId,
-			approving_origin_id: T::OriginId,
-		) -> DispatchResultWithPostInfo {
+			proposal_origin_id: T::OriginId,
+			approval_origin_id: T::OriginId,
+		) -> DispatchResult {
+			// Check call sender is authorized
 			let who = ensure_signed(origin)?;
 
-			// Try to fetch proposal from storage first
-			let mut proposal_info =
-				<Proposals<T>>::get(&call_hash, &origin_id).ok_or(Error::<T>::ProposalNotFound)?;
+			// Ensure proposal exists
+			let mut proposal_info = <Proposals<T>>::get(&call_hash, &proposal_origin_id)
+				.ok_or(Error::<T>::ProposalNotFound)?;
 
-			// Check if caller is same as proposer of proposal but using a different origin ID
-			if who == proposal_info.proposer && approving_origin_id != origin_id {
+			// Check if proposal is expired
+			if Self::is_expired(&call_hash, &proposal_origin_id, &mut proposal_info) {
+				return Err(Error::<T>::ProposalExpired.into());
+			}
+
+			// Ensure proposal is in Pending state
+			ensure!(
+				proposal_info.status == ProposalStatus::Pending,
+				Error::<T>::ProposalNotPending
+			);
+
+			// Prevent self-approval with different origin
+			if proposal_info.proposer == who && proposal_origin_id.clone() != approval_origin_id.clone() {
 				return Err(Error::<T>::CannotApproveOwnProposalUsingDifferentOrigin.into());
 			}
 
-			// Check if proposal has expired
-			if let Some(expiry) = proposal_info.expiry {
-				let current_block = frame_system::Pallet::<T>::block_number();
-				if current_block > expiry {
-					proposal_info.status = ProposalStatus::Expired;
-					<Proposals<T>>::insert(call_hash, origin_id, proposal_info);
-					Self::deposit_event(Event::ProposalExpired {
-						proposal_hash: call_hash,
-						origin_id,
-					});
-					return Err(Error::<T>::ProposalExpired.into());
-				}
-			}
+			// Check if the origin already approved this proposal
+			ensure!(
+				!<Approvals<T>>::contains_key((&call_hash, &proposal_origin_id), &approval_origin_id),
+				Error::<T>::OriginAlreadyApproved,
+			);
 
-			// Check if proposal still pending
-			if proposal_info.status != ProposalStatus::Pending {
-				return match proposal_info.status {
-					ProposalStatus::Executed => Err(Error::<T>::ProposalAlreadyExecuted.into()),
-					ProposalStatus::Expired => Err(Error::<T>::ProposalExpired.into()),
-					_ => Err(Error::<T>::ProposalNotFound.into()),
-				};
-			}
-
-			// Check if origin_id already approved
-			if <Approvals<T>>::contains_key((call_hash, origin_id), approving_origin_id) {
-				return Err(Error::<T>::OriginAlreadyApproved.into());
-			}
-
-			// Add to storage to mark this origin as approved
+			// Add to storage to mark this origin as approved and who approved
 			<Approvals<T>>::insert(
-				(call_hash, origin_id.clone()),
-				approving_origin_id.clone(),
+				(&call_hash, &proposal_origin_id),
+				&approval_origin_id,
 				who.clone(),
 			);
 
-			// Add to proposal's approvals list if not yet present
-			if !proposal_info.approvals.contains(&approving_origin_id) {
-				if proposal_info.approvals.try_push(approving_origin_id).is_err() {
+			// Try to add approval to list of approvals of the proposal
+			if !proposal_info.approvals.contains(&approval_origin_id) {
+				if proposal_info.approvals.try_push(approval_origin_id).is_err() {
 					return Err(Error::<T>::TooManyApprovals.into());
 				}
 			}
@@ -382,37 +425,14 @@ pub mod pallet {
 			// Emit approval event
 			Self::deposit_event(Event::OriginApprovalAdded {
 				proposal_hash: call_hash,
-				origin_id: origin_id.clone(),
-				approving_origin_id,
+				origin_id: proposal_origin_id.clone(),
+				approval_origin_id: approval_origin_id.clone(),
+				who: who.clone(),
 			});
 
-			// Pass a clone of proposal info so original does not get modified if execution attempt
-			// fails
-			match Self::check_and_execute_proposal(call_hash, origin_id, proposal_info.clone()) {
-				// Success case results in proposal being executed
-				Ok(_) => {},
-				// Check if error is specifically the `InsufficientApprovals` error since we need
-				// to silently ignore it when adding early approvals
-				Err(e) => match e {
-					DispatchError::Module(module_error) => {
-						if module_error.index == <Self as PalletInfoAccess>::index() as u8 {
-							let insufficient_approvals_index =
-								Self::error_index(Error::<T>::InsufficientApprovals);
-
-							// Propagate all errors except `InsufficientApprovals` error
-							if module_error.error[0] != insufficient_approvals_index {
-								return Err(DispatchError::Module(module_error).into());
-							}
-							// Otherwise silently ignore InsufficientApprovals error
-						} else {
-							// Error from another pallet must always be propagated
-							return Err(DispatchError::Module(module_error).into());
-						}
-					},
-					// Non-module errors must always be propagated
-					_ => return Err(e.into()),
-				},
-			}
+			// Pass clone of proposal info so original not modified if execution attempt fails
+			Self::maybe_execute(&call_hash, &proposal_origin_id, proposal_info)
+				.map_err(|e| e)?;
 
 			Ok(().into())
 		}
@@ -445,7 +465,7 @@ pub mod pallet {
 			// at lower cost
 			proposal.status = ProposalStatus::Cancelled;
 
-			// Clean up all approvals from Approvals storage efficiently
+			// Remove all approvals from Approvals storage efficiently
 			<Approvals<T>>::remove_prefix((proposal_hash, origin_id.clone()), None);
 
 			// Update storage with cancelled status
@@ -454,11 +474,58 @@ pub mod pallet {
 			// Remove actual call data (unbounded) to save storage
 			<ProposalCalls<T>>::remove(proposal_hash);
 
-			// Remove proposal from storage to clean up all approvals
+			// Remove proposal from storage to remove all approvals
 			Proposals::<T>::remove(&proposal_hash, &origin_id);
 
 			// Emit event
 			Self::deposit_event(Event::ProposalCancelled { proposal_hash, origin_id });
+
+			Ok(().into())
+		}
+
+		/// Remove an expired proposal from storage.
+		///
+		/// Dispatch origin of call must be signed by original proposer
+		/// or governance. Use batch call to remove multiple expired proposals.
+		///
+		/// - `call_hash`: Hash of call to be executed.
+		/// - `origin_id`: Origin identifier used to create proposal.
+		#[pallet::call_index(3)]
+		#[pallet::weight(<T as pallet::Config>::WeightInfo::cancel_proposal())]
+		pub fn remove(
+			origin: OriginFor<T>,
+			call_hash: T::Hash,
+			origin_id: T::OriginId,
+		) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin.clone())?;
+
+			// Check proposal exists
+			let proposal_info =
+				<Proposals<T>>::get(&call_hash, &origin_id).ok_or(Error::<T>::ProposalNotFound)?;
+
+			// Check if proposal expired
+			match proposal_info.status {
+				ProposalStatus::Expired => {},
+				_ => return Err(Error::<T>::ProposalNotExpired.into()),
+			}
+
+			// Check authorization to remove expired proposal
+			let is_proposer = who == proposal_info.proposer;
+			let is_governance = T::GovernanceOrigin::try_origin(origin.clone()).is_ok();
+
+			ensure!(is_proposer || is_governance, Error::<T>::NotAuthorized);
+
+			// Remove proposal from storage
+			<ProposalCalls<T>>::remove(&call_hash);
+			<Approvals<T>>::remove_prefix((&call_hash, &origin_id), None);
+			<Proposals<T>>::remove(&call_hash, &origin_id);
+
+			// Deposit event
+			Self::deposit_event(Event::ProposalRemoved {
+				proposal_hash: call_hash,
+				origin_id,
+				who,
+			});
 
 			Ok(().into())
 		}
@@ -473,7 +540,7 @@ pub mod pallet {
 		/// - `withdrawing_origin_id`: The origin id to withdraw the approval for since the account
 		///   might need to specify which of their multiple origin authorities they approved with
 		///   that they are now withdrawing approval for.
-		#[pallet::call_index(3)]
+		#[pallet::call_index(4)]
 		#[pallet::weight((<T as pallet::Config>::WeightInfo::withdraw_approval(), DispatchClass::Normal))]
 		pub fn withdraw_approval(
 			origin: OriginFor<T>,
@@ -486,6 +553,11 @@ pub mod pallet {
 			// Get proposal info
 			let mut proposal = Proposals::<T>::get(&proposal_hash, &origin_id)
 				.ok_or(Error::<T>::ProposalNotFound)?;
+
+			// Check if proposal expired and update its status if needed
+			if Self::is_expired(&proposal_hash, &origin_id, &mut proposal) {
+				return Err(Error::<T>::ProposalExpired.into());
+			}
 
 			ensure!(proposal.status == ProposalStatus::Pending, Error::<T>::ProposalNotPending);
 
@@ -536,7 +608,7 @@ pub mod pallet {
 		///
 		/// The weight for this extrinsic we use our own weight object `WeightForSetDummy`
 		/// or set_dummy() extrinsic to determine its weight
-		#[pallet::call_index(4)]
+		#[pallet::call_index(5)]
 		// #[pallet::weight(WeightForSetDummy::<T>(<BalanceOf<T>>::from(100u64.into())))]
 		#[pallet::weight(<T as pallet::Config>::WeightInfo::set_dummy())]
 		pub fn set_dummy(
@@ -582,9 +654,14 @@ pub mod pallet {
 		},
 		/// An origin has added their approval of a proposal.
 		OriginApprovalAdded {
+			/// Hash of the proposal.
 			proposal_hash: T::Hash,
+			/// Origin identifier.
 			origin_id: T::OriginId,
-			approving_origin_id: T::OriginId,
+			/// Origin identifier of the approval origin.
+			approval_origin_id: T::OriginId,
+			/// Account that added the approval.
+			who: T::AccountId,
 		},
 		/// A proposal has been executed.
 		ProposalExecuted {
@@ -607,6 +684,12 @@ pub mod pallet {
 			proposal_hash: T::Hash,
 			origin_id: T::OriginId,
 			withdrawing_origin_id: T::OriginId,
+		},
+		/// A proposal has been removed.
+		ProposalRemoved {
+			proposal_hash: T::Hash,
+			origin_id: T::OriginId,
+			who: T::AccountId,
 		},
 		SetDummy {
 			balance: BalanceOf<T>,
@@ -631,6 +714,8 @@ pub mod pallet {
 		ProposalAlreadyExecuted,
 		/// The proposal has expired
 		ProposalExpired,
+		/// The proposal is not expired
+		ProposalNotExpired,
 		/// The proposal was cancelled
 		ProposalCancelled,
 		/// The proposal was already approved by the origin
@@ -639,6 +724,8 @@ pub mod pallet {
 		InsufficientApprovals,
 		/// The origin approval could not be found
 		OriginApprovalNotFound,
+		/// Failed to execute proposal
+		FailedToExecute,
 	}
 
 	/// Status of proposal
@@ -662,12 +749,21 @@ pub mod pallet {
 		pub call_hash: Hash,
 		/// The block number after which this proposal expires
 		pub expiry: Option<BlockNumber>,
-		/// List of `OriginId`s that have approved this proposal
+		/// List of origins that have approved this proposal
 		pub approvals: BoundedVec<OriginId, MaxApprovals>,
 		/// The current status of this proposal
 		pub status: ProposalStatus,
 		/// The original proposer of this proposal
 		pub proposer: AccountId,
+	}
+
+	/// Timepoint is combination of block number and extrinsic index in that block
+	#[derive(Copy, Clone, Eq, PartialEq, Encode, Decode, Default, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+	pub struct TimePoint<BlockNumber> {
+		/// Block number
+		pub height: BlockNumber,
+		/// Extrinsic index
+		pub index: u32,
 	}
 
 	/// Storage for proposals
@@ -691,7 +787,7 @@ pub mod pallet {
 		Blake2_128Concat,
 		(T::Hash, T::OriginId), // e.g. (proposal_hash, origin_id)
 		Blake2_128Concat,
-		T::OriginId,  // e.g. approving_origin_id or withdrawing_origin_id
+		T::OriginId,  // e.g. approval_origin_id or withdrawing_origin_id
 		T::AccountId, // e.g. account that added the approval
 		OptionQuery,
 	>;
@@ -703,6 +799,17 @@ pub mod pallet {
 	#[pallet::getter(fn proposal_calls)]
 	pub type ProposalCalls<T: Config> =
 		StorageMap<_, Identity, T::Hash, Box<<T as Config>::RuntimeCall>, OptionQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn current_timepoint)]
+	pub(super) type CurrentTimepoint<T: Config> = StorageValue<_, TimePoint<BlockNumberFor<T>>>;
+
+	/// Record of timepoints including block number and extrinsic index that is used for
+	/// proposal execution or expiry
+	#[pallet::storage]
+	#[pallet::getter(fn executed_calls)]
+	pub(super) type ExecutedCalls<T: Config> =
+		StorageMap<_, Twox64Concat, TimePoint<BlockNumberFor<T>>, T::Hash>;
 
 	#[pallet::storage]
 	pub(super) type Dummy<T: Config> = StorageValue<_, T::Balance>;
