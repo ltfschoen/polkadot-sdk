@@ -21,7 +21,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use codec::{Decode, DecodeWithMemTracking, Encode};
+use codec::{Decode, DecodeWithMemTracking, Encode, Error as CodecError};
 use core::marker::PhantomData;
 use frame_support::{
 	dispatch::{
@@ -63,6 +63,21 @@ pub mod benchmarking;
 /// Type alias for balance type from balances pallet.
 // TODO: Remove use of balance pallet since it does not appear to be required
 pub type BalanceOf<T> = <T as pallet_balances::Config>::Balance;
+
+/// A timepoint represents a specific moment (block number and extrinsic index).
+#[derive(
+	Clone, Eq, PartialEq, Encode, Decode, Default, RuntimeDebug, MaxEncodedLen, TypeInfo, Copy,
+)]
+pub struct Timepoint<BlockNumber> {
+	/// The block number at which the timepoint was recorded.
+	pub height: BlockNumber,
+	/// The extrinsic index within the block.
+	pub index: u32,
+}
+
+// The simple empty implementation is the correct way to implement this trait
+// for types that already implement Decode
+impl<BlockNumber: Decode> DecodeWithMemTracking for Timepoint<BlockNumber> {}
 
 /// Helper struct that requires approval from two origins.
 pub struct AndGate<A, B>(PhantomData<(A, B)>);
@@ -221,11 +236,21 @@ pub mod pallet {
 					// Clean up call data since it's no longer needed
 					<ProposalCalls<T>>::remove(proposal_hash);
 
-					// Emit event with the dispatch result
+					// Create timepoint for execution
+					let execution_timepoint = Timepoint {
+						height: frame_system::Pallet::<T>::block_number(),
+						index: frame_system::Pallet::<T>::extrinsic_index().unwrap_or_default(),
+					};
+
+					// Store in ExecutedCalls mapping
+					<ExecutedCalls<T>>::insert(execution_timepoint.clone(), proposal_hash);
+
+					// Emit event
 					Self::deposit_event(Event::ProposalExecuted {
 						proposal_hash,
 						origin_id,
 						result: result.map(|_| ()).map_err(|e| e.error),
+						timepoint: execution_timepoint,
 					});
 
 					return Ok(());
@@ -298,18 +323,28 @@ pub mod pallet {
 			// Store proposal metadata (bounded storage)
 			<Proposals<T>>::insert(proposal_hash, origin_id.clone(), proposal_info);
 
-			// Mark first approval in approvals storage (bounded)
+			// Mark first approval in approvals storage efficiently
 			<Approvals<T>>::insert(
 				(proposal_hash, origin_id.clone()),
 				origin_id.clone(),
 				who.clone(),
 			);
 
-			// Store actual call data (unbounded)
+			// Store actual call data (unbounded) to save storage
 			<ProposalCalls<T>>::insert(proposal_hash, call);
 
+			// Create timepoint for submission
+			let submission_timepoint = Timepoint {
+				height: frame_system::Pallet::<T>::block_number(),
+				index: frame_system::Pallet::<T>::extrinsic_index().unwrap_or_default(),
+			};
+
 			// Emit event
-			Self::deposit_event(Event::ProposalCreated { proposal_hash, origin_id });
+			Self::deposit_event(Event::ProposalCreated {
+				proposal_hash,
+				origin_id,
+				timepoint: submission_timepoint,
+			});
 
 			Ok(().into())
 		}
@@ -343,6 +378,10 @@ pub mod pallet {
 					Self::deposit_event(Event::ProposalExpired {
 						proposal_hash: call_hash,
 						origin_id,
+						timepoint: Timepoint {
+							height: current_block,
+							index: frame_system::Pallet::<T>::extrinsic_index().unwrap_or_default(),
+						},
 					});
 					return Err(Error::<T>::ProposalExpired.into());
 				}
@@ -380,10 +419,15 @@ pub mod pallet {
 			<Proposals<T>>::insert(call_hash, origin_id.clone(), &proposal_info);
 
 			// Emit approval event
+			let approval_timepoint = Timepoint {
+				height: frame_system::Pallet::<T>::block_number(),
+				index: frame_system::Pallet::<T>::extrinsic_index().unwrap_or_default(),
+			};
 			Self::deposit_event(Event::OriginApprovalAdded {
 				proposal_hash: call_hash,
 				origin_id: origin_id.clone(),
 				approving_origin_id,
+				timepoint: approval_timepoint,
 			});
 
 			// Pass a clone of proposal info so original does not get modified if execution attempt
@@ -458,7 +502,15 @@ pub mod pallet {
 			Proposals::<T>::remove(&proposal_hash, &origin_id);
 
 			// Emit event
-			Self::deposit_event(Event::ProposalCancelled { proposal_hash, origin_id });
+			let cancellation_timepoint = Timepoint {
+				height: frame_system::Pallet::<T>::block_number(),
+				index: frame_system::Pallet::<T>::extrinsic_index().unwrap_or_default(),
+			};
+			Self::deposit_event(Event::ProposalCancelled {
+				proposal_hash,
+				origin_id,
+				timepoint: cancellation_timepoint,
+			});
 
 			Ok(().into())
 		}
@@ -487,6 +539,12 @@ pub mod pallet {
 			let mut proposal = Proposals::<T>::get(&proposal_hash, &origin_id)
 				.ok_or(Error::<T>::ProposalNotFound)?;
 
+			// Check if proposal has already been executed
+			if proposal.status == ProposalStatus::Executed {
+				return Err(Error::<T>::ProposalAlreadyExecuted.into());
+			}
+
+			// Check if proposal is still pending
 			ensure!(proposal.status == ProposalStatus::Pending, Error::<T>::ProposalNotPending);
 
 			// Verify approval exists and check authorisation such that only original approver can
@@ -517,10 +575,15 @@ pub mod pallet {
 			<Approvals<T>>::remove((proposal_hash, origin_id), withdrawing_origin_id);
 
 			// Emit event
+			let withdrawal_timepoint = Timepoint {
+				height: frame_system::Pallet::<T>::block_number(),
+				index: frame_system::Pallet::<T>::extrinsic_index().unwrap_or_default(),
+			};
 			Self::deposit_event(Event::OriginApprovalWithdrawn {
 				proposal_hash,
 				origin_id,
 				withdrawing_origin_id,
+				timepoint: withdrawal_timepoint,
 			});
 
 			Ok(().into())
@@ -579,34 +642,40 @@ pub mod pallet {
 		ProposalCreated {
 			proposal_hash: T::Hash,
 			origin_id: T::OriginId,
+			timepoint: Timepoint<BlockNumberFor<T>>,
 		},
 		/// An origin has added their approval of a proposal.
 		OriginApprovalAdded {
 			proposal_hash: T::Hash,
 			origin_id: T::OriginId,
 			approving_origin_id: T::OriginId,
+			timepoint: Timepoint<BlockNumberFor<T>>,
 		},
 		/// A proposal has been executed.
 		ProposalExecuted {
 			proposal_hash: T::Hash,
 			origin_id: T::OriginId,
 			result: DispatchResult,
+			timepoint: Timepoint<BlockNumberFor<T>>,
 		},
 		/// A proposal has expired.
 		ProposalExpired {
 			proposal_hash: T::Hash,
 			origin_id: T::OriginId,
+			timepoint: Timepoint<BlockNumberFor<T>>,
 		},
 		/// A proposal has been cancelled.
 		ProposalCancelled {
 			proposal_hash: T::Hash,
 			origin_id: T::OriginId,
+			timepoint: Timepoint<BlockNumberFor<T>>,
 		},
 		/// An origin has withdrawn their approval of a proposal.
 		OriginApprovalWithdrawn {
 			proposal_hash: T::Hash,
 			origin_id: T::OriginId,
 			withdrawing_origin_id: T::OriginId,
+			timepoint: Timepoint<BlockNumberFor<T>>,
 		},
 		SetDummy {
 			balance: BalanceOf<T>,
@@ -703,6 +772,12 @@ pub mod pallet {
 	#[pallet::getter(fn proposal_calls)]
 	pub type ProposalCalls<T: Config> =
 		StorageMap<_, Identity, T::Hash, Box<<T as Config>::RuntimeCall>, OptionQuery>;
+
+	/// Mapping from timepoint to call hash, used to track executed calls
+	#[pallet::storage]
+	#[pallet::getter(fn executed_calls)]
+	pub type ExecutedCalls<T: Config> =
+		StorageMap<_, Blake2_128Concat, Timepoint<BlockNumberFor<T>>, T::Hash, OptionQuery>;
 
 	#[pallet::storage]
 	pub(super) type Dummy<T: Config> = StorageValue<_, T::Balance>;
