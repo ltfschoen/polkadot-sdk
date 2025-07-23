@@ -188,7 +188,45 @@ parameter_types! {
 	pub static NonCancelledProposalRetentionPeriod: BlockNumber = 50_000_000;
 	// Maximum number of proposals to expire per block
 	pub static MaxProposalsToExpirePerBlock: u32 = 10;
+	pub static MaxRemarkLength: u32 = 1024;
+	pub static MaxStorageIdLength: u32 = 128;
+	pub static MaxIdDescriptionLength: u32 = 256;
+	pub static MaxStorageIdsPerProposal: u32 = 20;
+	pub static MaxRemarksPerProposal: u32 = 50;
 }
+
+// Mock for OpenGov integration
+pub struct MockReferendaOrigin;
+
+impl EnsureOrigin<RuntimeOrigin> for MockReferendaOrigin {
+	type Success = ();
+
+	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
+		// Use frame_system's ensure_root function which is designed to check if an origin is root
+		match frame_system::ensure_root(o.clone()) {
+			Ok(_) => {
+				// Root origin
+				Ok(())
+			},
+			Err(_) => {
+				// Not root origin
+				Err(o)
+			},
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn try_successful_origin() -> Result<RuntimeOrigin, ()> {
+		// Return a root origin which will pass the origin check
+		Ok(frame_system::RawOrigin::Root.into())
+	}
+}
+
+// Combined origin type for testing both collective and OpenGov origins
+pub type TestCollectiveOrigin = frame_support::traits::EitherOfDiverse<
+	frame_system::EnsureRoot<AccountId>,
+	MockReferendaOrigin,
+>;
 
 impl pallet_origin_and_gate::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
@@ -196,6 +234,13 @@ impl pallet_origin_and_gate::Config for Test {
 	type RequiredApprovalsCount = RequiredApprovalsCount;
 	type Hashing = BlakeTwo256;
 	type OriginId = OriginId;
+	type MaxRemarkLength = MaxRemarkLength;
+	type MaxStorageIdLength = MaxStorageIdLength;
+	type MaxIdDescriptionLength = MaxIdDescriptionLength;
+	type MaxStorageIdsPerProposal = MaxStorageIdsPerProposal;
+	type MaxRemarksPerProposal = MaxRemarksPerProposal;
+	// Use the combined origin type that supports both collectives and OpenGov
+	type CollectiveOrigin = TestCollectiveOrigin;
 	type ProposalExpiry = ProposalExpiry;
 	type NonCancelledProposalRetentionPeriod = NonCancelledProposalRetentionPeriod;
 	type MaxProposalsToExpirePerBlock = MaxProposalsToExpirePerBlock;
