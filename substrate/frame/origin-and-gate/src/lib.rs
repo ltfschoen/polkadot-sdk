@@ -232,7 +232,7 @@ pub mod pallet {
 		/// Benefits:
 		///   - On-chain Queryability: Providing the option to retain proposal data in storage to
 		///     provide on-chain queryability allows other pallets, smart contracts, or runtime
-		///     logic to query the
+		/// logic to query the
 		///    status and details of recently executed or expired proposals. Whilst events are
 		/// emitted and    can be found in block explorers, or off-chain indexing could be used,
 		/// they are not directly    queryable on-chain. Chains with storage constraints may opt
@@ -421,7 +421,7 @@ pub mod pallet {
 					<Proposals<T>>::insert(
 						proposal_hash,
 						proposal_origin_id.clone(),
-						proposal_info,
+						proposal_info.clone(),
 					);
 
 					// Create timepoint for execution
@@ -435,6 +435,7 @@ pub mod pallet {
 						proposal_origin_id,
 						result: result.map(|_| ()).map_err(|e| e.error),
 						timepoint: execution_timepoint,
+						is_collective: proposal_info.is_collective,
 					});
 
 					return Ok(().into());
@@ -499,9 +500,16 @@ pub mod pallet {
 		/// Helper to clean up all storage related to a proposal
 		fn remove_proposal_storage(proposal_hash: T::Hash, proposal_origin_id: T::OriginId) {
 			<ProposalCalls<T>>::remove(proposal_hash);
-			<Approvals<T>>::remove_prefix((proposal_hash, proposal_origin_id.clone()), None);
+			<Approvals<T>>::clear_prefix((proposal_hash, proposal_origin_id.clone()), u32::MAX, None);
 			<Proposals<T>>::remove(proposal_hash, proposal_origin_id);
 			<GovernanceHashes<T>>::remove(proposal_hash);
+			for ((hash, origin_id, approving_origin_id), _) in
+				<WithdrawnApprovals<T>>::iter()
+			{
+				if hash == proposal_hash && origin_id == proposal_origin_id {
+					<WithdrawnApprovals<T>>::remove((hash, origin_id, approving_origin_id));
+				}
+			}
 		}
 
 		/// Helper function to check if terminal proposal (Executed, Expired, Cancelled) is eligible
@@ -559,15 +567,21 @@ pub mod pallet {
 		/// Helper function to publish a remark on-chain
 		/// and emit the appropriate event based on the remark type.
 		fn publish_remark(
-			who: &T::AccountId,
-			proposal_hash: T::Hash,
-			proposal_origin_id: T::OriginId,
+			proposal_info: &ProposalInfo<
+				T::Hash,
+				BlockNumberFor<T>,
+				T::OriginId,
+				T::AccountId,
+				T::RequiredApprovalsCount,
+			>,
 			remark: Vec<u8>,
 			remark_type: RemarkType,
 			storage_id: Option<BoundedVec<u8, T::MaxStorageIdLength>>,
 			storage_id_description: Option<BoundedVec<u8, T::MaxStorageIdDescriptionLength>>,
 			timepoint: Timepoint<BlockNumberFor<T>>,
 			approving_origin_id: Option<T::OriginId>,
+			approving_account_id: Option<T::AccountId>,
+			is_collective_override: Option<bool>,
 		) -> DispatchResultWithPostInfo {
 			// Ensure the remark is not too long
 			ensure!(remark.len() <= T::MaxRemarkLength::get() as usize, Error::<T>::RemarkTooLong);
@@ -576,31 +590,38 @@ pub mod pallet {
 			let remark_call = frame_system::Call::<T>::remark { remark: remark.clone() };
 			let remark_call: <T as Config>::RuntimeCall = remark_call.into();
 			let _ = remark_call
-				.dispatch(frame_system::RawOrigin::Signed(who.clone()).into())
+				.dispatch(frame_system::RawOrigin::Signed(proposal_info.proposer.clone()).into())
 				.map_err(|e| e.error)?;
+
+			// Use override value if provided, otherwise fall back to proposal_info
+			let is_collective = is_collective_override.or(proposal_info.is_collective);
+			// Use override account if provided, otherwise use proposer
+			let account_id = approving_account_id.unwrap_or_else(|| proposal_info.proposer.clone());
 
 			// Emit appropriate event based on remark type
 			match remark_type {
 				RemarkType::Initial => {
-					// If approving_origin_id is None it ss from `propose` extrinsic
+					// If approving_origin_id is None it's from `propose` extrinsic
 					if approving_origin_id.is_none() {
-						Self::deposit_event(Event::ProposalCreatedWithRemark {
-							proposal_hash,
-							proposal_origin_id,
-							proposer: who.clone(),
+						Self::deposit_event(Event::ProposalCreated {
+							proposal_hash: proposal_info.proposal_hash,
+							proposal_origin_id: proposal_info.proposal_origin_id,
+							proposer: proposal_info.proposer.clone(),
 							timepoint,
-							remark: remark.clone(),
+							remark: Some(remark.clone()),
+							is_collective: is_collective,
 						});
 					} else {
 						// Otherwise it's from `add_approval` extrinsic
 						if let Some(approving_id) = approving_origin_id {
-							Self::deposit_event(Event::OriginApprovalAmendedWithRemark {
-								proposal_hash,
-								proposal_origin_id,
+							Self::deposit_event(Event::OriginApprovalAdded {
+								proposal_hash: proposal_info.proposal_hash,
+								proposal_origin_id: proposal_info.proposal_origin_id,
 								approving_origin_id: approving_id,
-								approving_account_id: who.clone(),
+								approving_account_id: account_id.clone(),
 								timepoint,
-								remark: remark.clone(),
+								remark: Some(remark.clone()),
+								is_collective: is_collective,
 							});
 						}
 					}
@@ -609,73 +630,88 @@ pub mod pallet {
 					// If approving_origin_id is provided it's an approver amending remark
 					if let Some(approving_id) = approving_origin_id {
 						Self::deposit_event(Event::OriginApprovalAmendedWithRemark {
-							proposal_hash,
-							proposal_origin_id,
+							proposal_hash: proposal_info.proposal_hash,
+							proposal_origin_id: proposal_info.proposal_origin_id,
 							approving_origin_id: approving_id,
-							approving_account_id: who.clone(),
+							approving_account_id: account_id.clone(),
 							timepoint,
-							remark: remark.clone(),
+							remark: Some(remark.clone()),
+							is_collective: Some(is_collective.unwrap_or(false)),
 						});
 					} else {
 						// If no approving_origin_id is provided, this is the proposer amending the
 						// proposal remark
 						Self::deposit_event(Event::ProposerAmendedProposalWithRemark {
-							proposal_hash,
-							proposal_origin_id: proposal_origin_id.clone(),
-							proposer_account_id: who.clone(),
+							proposal_hash: proposal_info.proposal_hash,
+							proposal_origin_id: proposal_info.proposal_origin_id,
+							proposer_account_id: account_id.clone(),
 							timepoint,
-							remark: remark.clone(),
+							remark: Some(remark.clone()),
+							is_collective: Some(is_collective.unwrap_or(false)),
 						});
 					}
 				},
 			}
 
 			// Update the remark in GovernanceHashes
-			<GovernanceHashes<T>>::try_mutate(proposal_hash, |maybe_hashes| -> DispatchResult {
-				let hashes = maybe_hashes.get_or_insert((
-					<T as frame_system::Config>::Hashing::hash_of(&[0u8]), // Default combined hash
-					BoundedBTreeMap::new(),                                // Empty remark hashes
-					BoundedVec::default(),                                 // Empty storage IDs
-				));
+			<GovernanceHashes<T>>::try_mutate(
+				proposal_info.proposal_hash,
+				|maybe_hashes| -> DispatchResult {
+					let hashes = maybe_hashes.get_or_insert_with(|| {
+						(T::Hash::default(), BoundedBTreeMap::default(), BoundedVec::default())
+					});
 
-				// Create a new map with the updated entry
-				let mut new_map = hashes.1.clone();
-				let remark_hash = <T as frame_system::Config>::Hashing::hash_of(&remark);
-				let bounded_remark = BoundedVec::<u8, T::MaxRemarkLength>::try_from(remark.clone())
-					.map_err(|_| Error::<T>::RemarkTooLong)?;
-				new_map
-					.try_insert(remark_hash, bounded_remark)
-					.map_err(|_| Error::<T>::TooManyRemarks)?;
+					// Create a new map with the updated entry
+					let mut new_map = hashes.1.clone();
+					let remark_hash = <T as frame_system::Config>::Hashing::hash_of(&remark);
+					let bounded_remark =
+						BoundedVec::<u8, T::MaxRemarkLength>::try_from(remark.clone())
+							.map_err(|_| Error::<T>::RemarkTooLong)?;
+					new_map
+						.try_insert(
+							remark_hash,
+							(
+								bounded_remark,
+								account_id.clone(),
+								proposal_info.proposal_origin_id.clone(),
+								approving_origin_id,
+								is_collective.unwrap_or(false),
+								timepoint.height,
+							),
+						)
+						.map_err(|_| Error::<T>::TooManyRemarks)?;
 
-				// Replace the entire tuple field with the new map
-				*hashes = (hashes.0.clone(), new_map, hashes.2.clone());
+					// Replace the entire tuple field with the new map
+					*hashes = (hashes.0.clone(), new_map, hashes.2.clone());
 
-				// Emit RemarkStored event when a remark is stored
-				Self::deposit_event(Event::RemarkStored {
-					proposal_hash,
-					proposal_origin_id,
-					account_id: who.clone(),
-					remark_hash,
-				});
+					// Emit RemarkStored event when a remark is stored
+					Self::deposit_event(Event::RemarkStored {
+						proposal_hash: proposal_info.proposal_hash,
+						proposal_origin_id: proposal_info.proposal_origin_id,
+						account_id: account_id.clone(),
+						remark_hash,
+						is_collective: Some(is_collective.unwrap_or(false)),
+					});
 
-				Ok(())
-			})?;
+					Ok(())
+				},
+			)?;
 
 			// Add storage ID if provided
 			if let Some(id) = storage_id {
 				Self::attach_storage_id_to_proposal(
-					who.clone(),
-					proposal_hash,
-					proposal_origin_id.clone(),
+					&account_id,
+					proposal_info.proposal_hash,
+					proposal_info.proposal_origin_id.clone(),
 					id.clone(),
 					storage_id_description.clone(),
 				)?;
 
 				// Emit event for the storage ID addition
 				Self::deposit_event(Event::StorageIdAdded {
-					proposal_hash,
-					proposal_origin_id,
-					account_id: who.clone(),
+					proposal_hash: proposal_info.proposal_hash,
+					proposal_origin_id: proposal_info.proposal_origin_id,
+					account_id: account_id.clone(),
 					storage_id: id,
 					storage_id_description,
 				});
@@ -737,12 +773,14 @@ pub mod pallet {
 			proposal_origin_id: T::OriginId,
 			storage_id: &BoundedVec<u8, T::MaxStorageIdLength>,
 		) -> DispatchResult {
-			if let Some((_, _, ids)) = <GovernanceHashes<T>>::get(proposal_hash) {
-				if let Some((_, _, added_by, _)) = ids.iter().find(|(id, _, _, _)| id == storage_id)
-				{
-					// Check if account added the identifier
-					if added_by == who {
-						return Ok(());
+			if let Some((_, _, storage_ids)) = <GovernanceHashes<T>>::get(proposal_hash) {
+				// First check if the account added this specific storage ID
+				for (id, _, account_id, _) in storage_ids.iter() {
+					if id == storage_id {
+						// Compare the account IDs directly
+						if account_id == who {
+							return Ok(());
+						}
 					}
 				}
 			}
@@ -755,64 +793,46 @@ pub mod pallet {
 			)
 		}
 
-		/// Helper function to add a storage identifier to a proposal
-		fn attach_storage_id_to_proposal(
-			who: T::AccountId,
+		/// Helper function to attach a storage ID to a proposal
+		pub fn attach_storage_id_to_proposal(
+			account_id: &T::AccountId,
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
 			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
 			storage_id_description: Option<BoundedVec<u8, T::MaxStorageIdDescriptionLength>>,
 		) -> DispatchResult {
-			// Check proposal exists
+			// Ensure the proposal exists
 			ensure!(
 				<Proposals<T>>::contains_key(proposal_hash, proposal_origin_id),
 				Error::<T>::ProposalNotFound
 			);
 
-			// Check account can add storage IDs
-			Self::ensure_account_origin_authorized_to_manage_proposal_storage_ids(
-				&who,
-				proposal_hash,
-				proposal_origin_id,
-			)?;
+			// Ensure the storage ID doesn't already exist for this proposal
+			ensure!(
+				!Self::has_storage_id_for_proposal(proposal_hash, &storage_id),
+				Error::<T>::StorageIdAlreadyPresent
+			);
 
-			// Add or update the storage ID in GovernanceHashes
+			// Get the current block number
+			let now = <frame_system::Pallet<T>>::block_number();
+
+			// Update the storage IDs in GovernanceHashes
 			<GovernanceHashes<T>>::try_mutate(proposal_hash, |maybe_hashes| -> DispatchResult {
-				let hashes = maybe_hashes.get_or_insert((
-					<T as frame_system::Config>::Hashing::hash_of(&[0u8]), // Default combined hash
-					BoundedBTreeMap::new(),                                // Empty remark hashes
-					BoundedVec::default(),                                 // Empty storage IDs
-				));
+				let hashes = maybe_hashes.get_or_insert_with(|| {
+					(T::Hash::default(), BoundedBTreeMap::default(), BoundedVec::default())
+				});
 
-				// Check if the storage ID already exists
-				if hashes.2.iter().any(|(id, _, _, _)| id == &storage_id) {
-					return Err(Error::<T>::StorageIdAlreadyPresent.into());
-				}
-
-				// Add the new storage ID with metadata
-				hashes
-					.2
-					.try_push((
-						storage_id.clone(),
-						frame_system::Pallet::<T>::block_number(),
-						who.clone(),
-						storage_id_description.clone(),
-					))
+				// Add the storage ID to the list
+				let mut new_ids = hashes.2.clone();
+				new_ids
+					.try_push((storage_id, now, account_id.clone(), storage_id_description))
 					.map_err(|_| Error::<T>::TooManyStorageIds)?;
 
+				// Update the storage IDs in the tuple
+				hashes.2 = new_ids;
+
 				Ok(())
-			})?;
-
-			// Emit event for the storage ID addition
-			Self::deposit_event(Event::StorageIdAdded {
-				proposal_hash,
-				proposal_origin_id,
-				account_id: who,
-				storage_id,
-				storage_id_description,
-			});
-
-			Ok(())
+			})
 		}
 
 		/// Helper function to remove a storage identifier from a proposal
@@ -820,7 +840,7 @@ pub mod pallet {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
 			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
-			who: T::AccountId,
+			who: &T::AccountId,
 		) -> DispatchResult {
 			// Check proposal exists
 			ensure!(
@@ -830,7 +850,7 @@ pub mod pallet {
 
 			// Check account can remove this specific storage ID
 			Self::ensure_account_origin_authorized_to_remove_proposal_storage_id(
-				&who,
+				who,
 				proposal_hash,
 				proposal_origin_id,
 				&storage_id,
@@ -856,8 +876,10 @@ pub mod pallet {
 			// Emit event
 			Self::deposit_event(Event::StorageIdRemoved {
 				proposal_hash,
-				account_id: who,
+				proposal_origin_id,
+				account_id: who.clone(),
 				storage_id,
+				is_collective: Some(false),
 			});
 
 			Ok(())
@@ -898,6 +920,8 @@ pub mod pallet {
 		/// Helper function to filter storage IDs by a predicate
 		pub fn filter_storage_ids_for_proposal<F>(
 			proposal_hash: T::Hash,
+			proposal_origin_id: T::OriginId,
+			filter_collective: Option<bool>,
 			predicate: F,
 		) -> Vec<(
 			BoundedVec<u8, T::MaxStorageIdLength>,
@@ -913,42 +937,61 @@ pub mod pallet {
 				&Option<BoundedVec<u8, T::MaxStorageIdDescriptionLength>>,
 			) -> bool,
 		{
-			if let Some((_, _, ids)) = <GovernanceHashes<T>>::get(proposal_hash) {
-				ids.iter()
-					.filter(|(id, block, account, desc)| predicate(id, block, account, desc))
-					.map(|(id, block, account, desc)| {
-						(id.clone(), *block, account.clone(), desc.clone())
-					})
-					.collect()
-			} else {
-				Vec::new()
+			// Verify proposal exists with this combination
+			if <Proposals<T>>::contains_key(proposal_hash, proposal_origin_id) {
+				let proposal_info = <Proposals<T>>::get(proposal_hash, proposal_origin_id).unwrap();
+
+				// Check if need to filter by collective status
+				if let Some(is_collective) = filter_collective {
+					if proposal_info.is_collective != Some(is_collective) {
+						return vec![];
+					}
+				}
+
+				if let Some((_, _, ids)) = <GovernanceHashes<T>>::get(proposal_hash) {
+					return ids
+						.iter()
+						.filter(|(id, block, account, desc)| predicate(id, block, account, desc))
+						.map(|(id, block, account, desc)| {
+							(id.clone(), *block, account.clone(), desc.clone())
+						})
+						.collect();
+				}
 			}
+			Vec::new()
 		}
 
 		/// Helper function to get all IPFS CIDs for a proposal
 		/// that uses a heuristic to identify IPFS CIDs by common prefixes
 		pub fn get_proposal_ipfs_cids(
 			proposal_hash: T::Hash,
+			proposal_origin_id: T::OriginId,
+			filter_collective: Option<bool>,
 		) -> Vec<(
 			BoundedVec<u8, T::MaxStorageIdLength>,
 			BlockNumberFor<T>,
 			T::AccountId,
 			Option<BoundedVec<u8, T::MaxStorageIdDescriptionLength>>,
 		)> {
-			Self::filter_storage_ids_for_proposal(proposal_hash, |id, _, _, _| {
-				// Common IPFS CID prefixes (v0 and v1)
-				if id.len() > 2 {
-					// CIDv0 starts with "Qm"
-					if id.starts_with(b"Qm") {
-						return true;
+			Self::filter_storage_ids_for_proposal(
+				proposal_hash,
+				proposal_origin_id,
+				filter_collective,
+				|id, _, _, _| {
+					// Common IPFS CID prefixes (v0 and v1)
+					if id.len() > 2 {
+						// CIDv0 starts with "Qm"
+						if id.starts_with(b"Qm") {
+							return true;
+						}
+						// CIDv1 often starts with "bafy"
+						if id.len() > 4 && id.starts_with(b"bafy") {
+							return true;
+						}
 					}
-					// CIDv1 often starts with "bafy"
-					if id.len() > 4 && id.starts_with(b"bafy") {
-						return true;
-					}
-				}
-				false
-			})
+					false
+				},
+			)
 		}
 
 		/// Helper function to convert optional storage ID and description to bounded types
@@ -990,9 +1033,187 @@ pub mod pallet {
 			BoundedVec::<u8, T::MaxStorageIdLength>::try_from(storage_id)
 				.map_err(|_| Error::<T>::StorageIdTooLong.into())
 		}
+
+		/// Helper function to handle both collective and signed origins.
+		/// Returns:
+		/// - Account ID to use (default account for collective origins)
+		/// - Boolean whether origin is collective origin
+		fn ensure_signed_or_collective(
+			origin: OriginFor<T>,
+		) -> Result<(T::AccountId, bool), DispatchError> {
+			// Check if this is a collective origin
+			let is_collective = T::CollectiveOrigin::try_origin(origin.clone()).is_ok();
+
+			let who = if is_collective {
+				// Ensure origin is collective origin
+				T::CollectiveOrigin::ensure_origin(origin)?;
+				// Use zero address as proposer/approver for collective origins
+				T::AccountId::decode(&mut sp_runtime::traits::TrailingZeroInput::zeroes())
+					.unwrap_or_else(|_| {
+						panic!("Infinite length input; no invalid inputs for type; qed")
+					})
+			} else {
+				// Check extrinsic signed by normal account
+				ensure_signed(origin)?
+			};
+
+			Ok((who, is_collective))
+		}
+
+		/// Helper to get all remarks for a proposal with optional collective origin filtering
+		pub fn get_proposal_remarks(
+			proposal_hash: T::Hash,
+			proposal_origin_id: T::OriginId,
+			filter_collective: Option<bool>,
+		) -> Vec<(BoundedVec<u8, T::MaxRemarkLength>, T::AccountId)> {
+			// First verify the proposal exists with this combination
+			if <Proposals<T>>::contains_key(proposal_hash, proposal_origin_id) {
+				let proposal_info = <Proposals<T>>::get(proposal_hash, proposal_origin_id).unwrap();
+
+				// Check if we need to filter by collective status
+				if let Some(is_collective) = filter_collective {
+					if proposal_info.is_collective != Some(is_collective) {
+						return vec![];
+					}
+				}
+
+				if let Some((_, remark_hashes, _)) = <GovernanceHashes<T>>::get(proposal_hash) {
+					return remark_hashes
+						.iter()
+						.filter(|(_, (_, _, _, _, remark_is_collective, _))| {
+							// If filtering by collective status, only include matching remarks
+							if let Some(is_collective) = filter_collective {
+								*remark_is_collective == is_collective
+							} else {
+								true // Include all remarks if no filter
+							}
+						})
+						.map(|(_, (remark, proposer, _, _, _, _))| {
+							(remark.clone(), proposer.clone())
+						})
+						.collect();
+				}
+			}
+			vec![]
+		}
+
+		/// Helper to get all approvals for a proposal with optional collective origin filtering
+		pub fn get_proposal_approvals(
+			proposal_hash: T::Hash,
+			proposal_origin_id: T::OriginId,
+			filter_collective: Option<bool>,
+		) -> Vec<(T::OriginId, T::AccountId, bool)> {
+			let mut approvals = Vec::new();
+
+			// Verify proposal exists with this combination
+			if <Proposals<T>>::contains_key(proposal_hash, proposal_origin_id) {
+				// Iterate through all approvals for this proposal
+				for ((hash, origin_id), approving_id, (account_id, is_collective)) in
+					<Approvals<T>>::iter()
+				{
+					if hash == proposal_hash && origin_id == proposal_origin_id {
+						// Apply collective filter if specified
+						if let Some(filter) = filter_collective {
+							if is_collective == filter {
+								approvals.push((approving_id, account_id, is_collective));
+							}
+						} else {
+							approvals.push((approving_id, account_id, is_collective));
+						}
+					}
+				}
+			}
+
+			approvals
+		}
+
+		/// Helper to get proposals by status with optional collective origin filtering
+		fn get_proposals_by_status(
+			status: ProposalStatus,
+			filter_collective: Option<bool>,
+		) -> Vec<(T::Hash, T::OriginId)> {
+			let mut result = Vec::new();
+
+			for (hash, origin_id, proposal_info) in <Proposals<T>>::iter() {
+				if status == proposal_info.status {
+					// Apply collective filter if specified
+					if let Some(filter) = filter_collective {
+						if let Some(is_collective) = proposal_info.is_collective {
+							if is_collective == filter {
+								result.push((hash, origin_id));
+							}
+						}
+					} else {
+						result.push((hash, origin_id));
+					}
+				}
+			}
+
+			result
+		}
+
+		/// Get cancelled proposals with optional collective origin filtering
+		pub fn get_proposals_cancelled(
+			filter_collective: Option<bool>,
+		) -> Vec<(T::Hash, T::OriginId)> {
+			Self::get_proposals_by_status(ProposalStatus::Cancelled, filter_collective)
+		}
+
+		/// Get expired proposals with optional collective origin filtering
+		pub fn get_proposals_expired(
+			filter_collective: Option<bool>,
+		) -> Vec<(T::Hash, T::OriginId)> {
+			Self::get_proposals_by_status(ProposalStatus::Expired, filter_collective)
+		}
+
+		/// Get executed proposals with optional collective origin filtering
+		pub fn get_proposals_executed(
+			filter_collective: Option<bool>,
+		) -> Vec<(T::Hash, T::OriginId)> {
+			Self::get_proposals_by_status(ProposalStatus::Executed, filter_collective)
+		}
+
+		/// Get withdrawn approvals with optional collective origin filtering
+		pub fn get_approvals_withdrawn(
+			filter_collective: Option<bool>,
+		) -> Vec<(T::Hash, T::OriginId, T::OriginId, T::AccountId, bool, BlockNumberFor<T>)> {
+			let mut withdrawn = Vec::new();
+
+			for ((hash, proposal_origin_id, approving_origin_id), values) in
+				<WithdrawnApprovals<T>>::iter()
+			{
+				// Iterate through each entry in the Vec
+				for (account_id, is_collective, block_number) in values {
+					// Apply collective filter if specified
+					if let Some(filter) = filter_collective {
+						if is_collective == filter {
+							withdrawn.push((
+								hash,
+								proposal_origin_id.clone(),
+								approving_origin_id.clone(),
+								account_id,
+								is_collective,
+								block_number,
+							));
+						}
+					} else {
+						withdrawn.push((
+							hash,
+							proposal_origin_id.clone(),
+							approving_origin_id.clone(),
+							account_id,
+							is_collective,
+							block_number,
+						));
+					}
+				}
+			}
+
+			withdrawn
+		}
 	}
 
-	#[pallet::call(weight(<T as Config>::WeightInfo))]
+	#[pallet::call(weight(<T as pallet::Config>::WeightInfo))]
 	impl<T: Config> Pallet<T> {
 		/// Submit a proposal for approval.
 		///
@@ -1028,7 +1249,7 @@ pub mod pallet {
 			auto_execute: Option<bool>,
 		) -> DispatchResultWithPostInfo {
 			// Check extrinsic was signed
-			let who = ensure_signed(origin)?;
+			let (who, is_collective) = Self::ensure_signed_or_collective(origin)?;
 			let current_block = <frame_system::Pallet<T>>::block_number();
 			let submission_timepoint = Self::current_timepoint();
 
@@ -1070,7 +1291,7 @@ pub mod pallet {
 			if duplicate_detected {
 				Self::deposit_event(Event::DuplicateProposalWarning {
 					proposal_hash: unique_proposal_hash,
-					proposal_origin_id: proposal_origin_id.clone(),
+					proposal_origin_id,
 					existing_proposal_hash: proposal_hash,
 					proposer: who.clone(),
 					timepoint: submission_timepoint,
@@ -1094,6 +1315,7 @@ pub mod pallet {
 			// Create and store proposal metadata (bounded storage)
 			let proposal_info = ProposalInfo {
 				proposal_hash: unique_proposal_hash,
+				proposal_origin_id: proposal_origin_id.clone(),
 				expiry_at: expiry_block,
 				approvals,
 				status: ProposalStatus::Pending,
@@ -1101,18 +1323,22 @@ pub mod pallet {
 				submitted_at: current_block,
 				executed_at: None,
 				auto_execute,
+				is_collective: Some(is_collective),
 			};
 
 			// Store proposal metadata (bounded storage)
-			<Proposals<T>>::insert(unique_proposal_hash, proposal_origin_id.clone(), proposal_info);
+			<Proposals<T>>::insert(
+				unique_proposal_hash,
+				proposal_origin_id.clone(),
+				proposal_info.clone(),
+			);
 
-			// Mark first approval in approvals storage efficiently only if proposer approval is
-			// included
+			// Mark first approval in approvals storage only if proposer approval is included
 			if include_proposer_approval.unwrap_or(false) {
 				<Approvals<T>>::insert(
 					(unique_proposal_hash, proposal_origin_id.clone()),
 					proposal_origin_id.clone(),
-					who.clone(),
+					(who.clone(), is_collective),
 				);
 			};
 
@@ -1126,17 +1352,17 @@ pub mod pallet {
 			}
 
 			// If a remark is provided then publish it on-chain
-			if let Some(remark_content) = remark {
+			if let Some(ref remark_content) = remark {
 				Self::publish_remark(
-					&who,
-					unique_proposal_hash,
-					proposal_origin_id.clone(),
-					remark_content,
+					&proposal_info,
+					remark_content.to_vec(),
 					RemarkType::Initial,
 					bounded_storage_id,
 					bounded_storage_id_description,
 					submission_timepoint,
 					None,
+					None,
+					Some(is_collective),
 				);
 			}
 
@@ -1144,7 +1370,10 @@ pub mod pallet {
 			Self::deposit_event(Event::ProposalCreated {
 				proposal_hash: unique_proposal_hash,
 				proposal_origin_id,
+				proposer: who.clone(),
 				timepoint: submission_timepoint,
+				remark,
+				is_collective: proposal_info.clone().is_collective,
 			});
 
 			Ok(().into())
@@ -1154,6 +1383,7 @@ pub mod pallet {
 		///
 		/// Optionally includes a remark that will be published on-chain
 		/// and associated with this approval.
+		/// Optionally including a storage ID (e.g. IPFS CID) and description
 		///
 		/// Parameters:
 		/// - `proposal_hash`: Proposal hash to approve.
@@ -1173,7 +1403,7 @@ pub mod pallet {
 			storage_id: Option<Vec<u8>>,
 			storage_id_description: Option<Vec<u8>>,
 		) -> DispatchResultWithPostInfo {
-			let who = ensure_signed(origin)?;
+			let (who, is_collective) = Self::ensure_signed_or_collective(origin)?;
 
 			let approval_timepoint = Self::current_timepoint();
 
@@ -1235,21 +1465,21 @@ pub mod pallet {
 			<Approvals<T>>::insert(
 				(proposal_hash, proposal_origin_id.clone()),
 				approving_origin_id.clone(),
-				who.clone(),
+				(who.clone(), is_collective),
 			);
 
 			// If remark is provided then publish it on-chain
-			if let Some(remark_content) = remark {
+			if let Some(ref remark_content) = remark {
 				Self::publish_remark(
-					&who,
-					proposal_hash,
-					proposal_origin_id.clone(),
-					remark_content,
+					&proposal_info,
+					remark_content.to_vec(),
 					RemarkType::Amend,
 					bounded_storage_id,
 					bounded_storage_id_description,
 					approval_timepoint,
 					Some(approving_origin_id.clone()),
+					Some(who.clone()),
+					Some(is_collective),
 				);
 			}
 
@@ -1260,6 +1490,8 @@ pub mod pallet {
 				approving_origin_id: approving_origin_id.clone(),
 				approving_account_id: who.clone(),
 				timepoint: approval_timepoint,
+				remark: remark.clone(),
+				is_collective: Some(is_collective),
 			});
 
 			// Check if proposal can be executed now and auto-execute if requested
@@ -1375,13 +1607,13 @@ pub mod pallet {
 				);
 
 				// Ensure the caller is the one who previously approved
-				let approving_account_id = <Approvals<T>>::get(
+				let approving_data = <Approvals<T>>::get(
 					(proposal_hash, proposal_origin_id.clone()),
 					approving_origin_id.clone(),
 				)
 				.ok_or(Error::<T>::AccountOriginApprovalNotFound)?;
 
-				ensure!(approving_account_id == who, Error::<T>::NotAuthorized);
+				ensure!(approving_data.0 == who, Error::<T>::NotAuthorized);
 			} else {
 				// Ensure the caller is the proposer
 				ensure!(who == proposal_info.proposer, Error::<T>::NotAuthorized);
@@ -1389,15 +1621,15 @@ pub mod pallet {
 
 			// Publish the remark on-chain
 			Self::publish_remark(
-				&who,
-				proposal_hash,
-				proposal_origin_id.clone(),
+				&proposal_info,
 				remark,
 				RemarkType::Amend,
 				bounded_storage_id,
 				bounded_storage_id_description,
 				update_timepoint,
 				approving_origin_id.clone(),
+				Some(who.clone()),
+				None,
 			);
 
 			Ok(().into())
@@ -1411,7 +1643,7 @@ pub mod pallet {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
 		) -> DispatchResultWithPostInfo {
-			ensure_signed(origin)?;
+			let (_, _) = Self::ensure_signed_or_collective(origin)?;
 
 			// Get proposal info
 			let mut proposal = <Proposals<T>>::get(&proposal_hash, &proposal_origin_id)
@@ -1436,8 +1668,7 @@ pub mod pallet {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
 		) -> DispatchResultWithPostInfo {
-			// Check extrinsic was signed
-			let who = ensure_signed(origin)?;
+			let (who, _) = Self::ensure_signed_or_collective(origin)?;
 
 			// Get proposal info
 			let mut proposal_info = Proposals::<T>::get(&proposal_hash, &proposal_origin_id)
@@ -1464,7 +1695,11 @@ pub mod pallet {
 			let expiry_at = proposal_info.expiry_at;
 
 			// Update storage with cancelled status
-			<Proposals<T>>::insert(&proposal_hash, &proposal_origin_id, proposal_info);
+			<Proposals<T>>::insert(
+				proposal_hash,
+				proposal_origin_id.clone(),
+				proposal_info,
+			);
 
 			// Clean up all storage related to the proposal
 			Self::remove_proposal_storage(proposal_hash, proposal_origin_id.clone());
@@ -1509,7 +1744,7 @@ pub mod pallet {
 			proposal_origin_id: T::OriginId,
 			withdrawing_origin_id: T::OriginId,
 		) -> DispatchResultWithPostInfo {
-			let who = ensure_signed(origin)?;
+			let (who, is_collective) = Self::ensure_signed_or_collective(origin)?;
 
 			// Get proposal info
 			let mut proposal = <Proposals<T>>::get(&proposal_hash, &proposal_origin_id)
@@ -1526,38 +1761,51 @@ pub mod pallet {
 			// Verify approval exists and check authorisation such that only original approver can
 			// withdraw their approval using our mapping from OriginId to AccountId where only
 			// the account that originally granted approval can withdraw it
-			let approval_account = <Approvals<T>>::get(
+			let approving_data = <Approvals<T>>::get(
 				(proposal_hash, proposal_origin_id.clone()),
 				withdrawing_origin_id.clone(),
 			)
 			.ok_or(Error::<T>::AccountOriginApprovalNotFound)?;
 
-			ensure!(approval_account == who, Error::<T>::NotAuthorized);
+			ensure!(approving_data.0 == who, Error::<T>::NotAuthorized);
 
 			// Find position of withdrawing_origin_id in approvals vector
 			let pos = proposal
 				.approvals
 				.iter()
-				.position(|a| a == &(who.clone(), withdrawing_origin_id.clone()))
+				.position(|a| a.0 == who && a.1 == withdrawing_origin_id)
 				.ok_or(Error::<T>::AccountOriginApprovalNotFound)?;
 
 			// Remove approval at found position
 			proposal.approvals.swap_remove(pos);
 
 			// Update proposal in storage
-			<Proposals<T>>::insert(&proposal_hash, &proposal_origin_id, &proposal);
+			<Proposals<T>>::insert(
+				proposal_hash,
+				proposal_origin_id.clone(),
+				proposal,
+			);
 
 			// Remove approval from Approvals storage
 			<Approvals<T>>::remove((proposal_hash, proposal_origin_id), withdrawing_origin_id);
 
 			// Emit event
-			let withdrawal_timepoint = Self::current_timepoint();
+			let timepoint = Self::current_timepoint();
+
+			// Record the withdrawn approval
+			let current_block = <frame_system::Pallet<T>>::block_number();
+			<WithdrawnApprovals<T>>::insert(
+				(proposal_hash, proposal_origin_id.clone(), withdrawing_origin_id.clone()),
+				vec![(who.clone(), is_collective, current_block)],
+			);
 
 			Self::deposit_event(Event::OriginApprovalWithdrawn {
 				proposal_hash,
 				proposal_origin_id,
 				withdrawing_origin_id,
-				timepoint: withdrawal_timepoint,
+				account_id: who,
+				timepoint,
+				is_collective: Some(is_collective),
 			});
 
 			Ok(().into())
@@ -1600,7 +1848,7 @@ pub mod pallet {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
 		) -> DispatchResultWithPostInfo {
-			ensure_signed(origin)?;
+			let (_, _) = Self::ensure_signed_or_collective(origin)?;
 
 			// Get proposal info
 			let proposal = <Proposals<T>>::get(&proposal_hash, &proposal_origin_id)
@@ -1657,13 +1905,13 @@ pub mod pallet {
 			storage_id: Vec<u8>,
 			storage_id_description: Option<Vec<u8>>,
 		) -> DispatchResultWithPostInfo {
-			let who = ensure_signed(origin)?;
+			let (who, _) = Self::ensure_signed_or_collective(origin)?;
 
 			let (bounded_storage_id, bounded_storage_id_description) =
 				Self::convert_to_bounded_types(Some(storage_id), storage_id_description)?;
 
 			Self::attach_storage_id_to_proposal(
-				who,
+				&who,
 				proposal_hash,
 				proposal_origin_id,
 				bounded_storage_id.unwrap(),
@@ -1694,53 +1942,71 @@ pub mod pallet {
 			proposal_origin_id: T::OriginId,
 			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
 		) -> DispatchResultWithPostInfo {
-			// Check if this is a collective origin or a signed origin
-			let is_collective = T::CollectiveOrigin::try_origin(origin.clone()).is_ok();
+			// Try to get the proposal info
+			let proposal_info = <Proposals<T>>::get(proposal_hash, proposal_origin_id.clone())
+				.ok_or(Error::<T>::ProposalNotFound)?;
 
-			if is_collective {
-				// Ensure the origin is the collective origin
-				T::CollectiveOrigin::ensure_origin(origin)?;
+			// Store a clone of the proposer for later use in events
+			let proposer = proposal_info.proposer.clone();
 
-				// Collective origins do not need check if proposal exists with proposal_origin_id
-				// instead we just check if storage ID exists and remove it
-				let mut found = false;
-				<GovernanceHashes<T>>::try_mutate(
-					proposal_hash,
-					|maybe_hashes| -> DispatchResult {
-						if let Some(hashes) = maybe_hashes {
-							let (_, _, ids) = hashes;
-							if let Some(idx) =
-								ids.iter().position(|(id, _, _, _)| id == &storage_id)
-							{
-								// Remove the storage ID
-								ids.remove(idx);
-								found = true;
-							}
-						}
-						Ok(())
-					},
-				)?;
+			// Ensure proposal is still pending
+			ensure!(
+				proposal_info.status == ProposalStatus::Pending,
+				Error::<T>::ProposalNotPending
+			);
 
-				// Ensure the storage ID was found and removed
-				ensure!(found, Error::<T>::ProposalStorageIdNotFound);
-
-				// Emit event for remove by authorized collective
-				Self::deposit_event(Event::StorageIdRemovedByCollective {
-					proposal_hash,
-					storage_id,
-				});
-			} else if let Ok(who) = ensure_signed(origin) {
-				// Signed origins
+			// Check if the origin is root
+			if let Ok(()) = ensure_root(origin.clone()) {
+				// Root can remove any storage ID
 				Self::detach_storage_id_from_proposal(
 					proposal_hash,
-					proposal_origin_id,
-					storage_id,
-					who,
+					proposal_origin_id.clone(),
+					storage_id.clone(),
+					&proposer.clone(), // Use cloned proposer
 				)?;
+			} else if let Ok((who, is_collective)) = Self::ensure_signed_or_collective(origin) {
+				// Ensure the caller is authorized to remove this storage ID
+				Self::ensure_account_origin_authorized_to_remove_proposal_storage_id(
+					&who,
+					proposal_hash,
+					proposal_origin_id,
+					&storage_id,
+				)?;
+
+				// Remove the storage ID
+				Self::detach_storage_id_from_proposal(
+					proposal_hash,
+					proposal_origin_id.clone(),
+					storage_id.clone(),
+					&who,
+				)?;
+
+				// Emit event with the correct account and is_collective flag
+				Self::deposit_event(Event::StorageIdRemoved {
+					proposal_hash,
+					proposal_origin_id: proposal_origin_id.clone(),
+					account_id: who,
+					storage_id: storage_id.clone(),
+					is_collective: Some(is_collective),
+				});
+
+				return Ok(().into());
 			} else {
-				// Neither a valid collective origin nor a signed origin
 				return Err(sp_runtime::traits::BadOrigin.into());
 			}
+
+			// Convert storage ID to bounded type for the event
+			let bounded_storage_id = BoundedVec::<u8, T::MaxStorageIdLength>::try_from(storage_id)
+				.map_err(|_| Error::<T>::StorageIdTooLong)?;
+
+			// Emit event for root origin (is_collective = false)
+			Self::deposit_event(Event::StorageIdRemoved {
+				proposal_hash,
+				proposal_origin_id,
+				account_id: proposer, // Use stored proposer clone
+				storage_id: bounded_storage_id,
+				is_collective: Some(false),
+			});
 
 			Ok(().into())
 		}
@@ -1750,9 +2016,9 @@ pub mod pallet {
 		#[pallet::weight(<T as pallet::Config>::WeightInfo::set_dummy())]
 		pub fn dummy_benchmark(
 			origin: OriginFor<T>,
-			remark: Vec<u8>,
+			_remark: Vec<u8>, // Prefix with underscore to indicate intentionally unused
 		) -> DispatchResultWithPostInfo {
-			ensure_signed(origin)?;
+			let (_, _) = Self::ensure_signed_or_collective(origin)?;
 			Ok(().into())
 		}
 	}
@@ -1760,11 +2026,15 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// A proposal has been created.
+		/// A proposal has been created with an optional remark
 		ProposalCreated {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
+			proposer: T::AccountId,
 			timepoint: Timepoint<BlockNumberFor<T>>,
+			remark: Option<Vec<u8>>,
+			#[codec(skip)]
+			is_collective: Option<bool>,
 		},
 		/// An origin has added their approval of a proposal.
 		OriginApprovalAdded {
@@ -1773,14 +2043,9 @@ pub mod pallet {
 			approving_origin_id: T::OriginId,
 			approving_account_id: T::AccountId,
 			timepoint: Timepoint<BlockNumberFor<T>>,
-		},
-		/// A proposal has been created with a remark.
-		ProposalCreatedWithRemark {
-			proposal_hash: T::Hash,
-			proposal_origin_id: T::OriginId,
-			proposer: T::AccountId,
-			timepoint: Timepoint<BlockNumberFor<T>>,
-			remark: Vec<u8>,
+			remark: Option<Vec<u8>>,
+			#[codec(skip)]
+			is_collective: Option<bool>,
 		},
 		/// A proposer amended their proposal with an additional remark.
 		ProposerAmendedProposalWithRemark {
@@ -1788,7 +2053,9 @@ pub mod pallet {
 			proposal_origin_id: T::OriginId,
 			proposer_account_id: T::AccountId,
 			timepoint: Timepoint<BlockNumberFor<T>>,
-			remark: Vec<u8>,
+			remark: Option<Vec<u8>>,
+			#[codec(skip)]
+			is_collective: Option<bool>,
 		},
 		/// An origin has amended their approval with an additional remark.
 		OriginApprovalAmendedWithRemark {
@@ -1797,7 +2064,9 @@ pub mod pallet {
 			approving_origin_id: T::OriginId,
 			approving_account_id: T::AccountId,
 			timepoint: Timepoint<BlockNumberFor<T>>,
-			remark: Vec<u8>,
+			remark: Option<Vec<u8>>,
+			#[codec(skip)]
+			is_collective: Option<bool>,
 		},
 		/// A proposal has been executed.
 		ProposalExecuted {
@@ -1805,6 +2074,8 @@ pub mod pallet {
 			proposal_origin_id: T::OriginId,
 			result: Result<(), DispatchError>,
 			timepoint: Timepoint<BlockNumberFor<T>>,
+			#[codec(skip)]
+			is_collective: Option<bool>,
 		},
 		/// A proposal has expired.
 		ProposalExpired {
@@ -1822,8 +2093,10 @@ pub mod pallet {
 		OriginApprovalWithdrawn {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
+			account_id: T::AccountId,
 			withdrawing_origin_id: T::OriginId,
 			timepoint: Timepoint<BlockNumberFor<T>>,
+			is_collective: Option<bool>,
 		},
 		SetDummy {
 			dummy_value: DummyValueOf,
@@ -1853,6 +2126,8 @@ pub mod pallet {
 			account_id: T::AccountId,
 			/// Hash of the remark.
 			remark_hash: T::Hash,
+			/// Whether the remark was added by a collective origin.
+			is_collective: Option<bool>,
 		},
 		/// A storage ID has been added to a proposal.
 		StorageIdAdded {
@@ -1871,17 +2146,27 @@ pub mod pallet {
 		StorageIdRemoved {
 			/// Hash of the proposal.
 			proposal_hash: T::Hash,
+			/// Origin ID of the proposal.
+			proposal_origin_id: T::OriginId,
 			/// Account that removed the storage ID.
 			account_id: T::AccountId,
 			/// Storage ID that was removed.
 			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
+			/// Whether the storage ID was removed by a collective origin.
+			is_collective: Option<bool>,
 		},
 		/// A storage ID has been removed by the collective origin.
 		StorageIdRemovedByCollective {
 			/// Hash of the proposal.
 			proposal_hash: T::Hash,
+			/// Origin ID of the proposal.
+			proposal_origin_id: T::OriginId,
+			/// Account that removed the storage ID.
+			account_id: T::AccountId,
 			/// Storage ID that was removed.
 			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
+			/// Whether the storage ID was removed by a collective origin.
+			is_collective: Option<bool>,
 		},
 	}
 
@@ -1970,6 +2255,8 @@ pub mod pallet {
 	> {
 		/// Call hash of this proposal to execute
 		pub proposal_hash: Hash,
+		/// Origin ID of this proposal
+		pub proposal_origin_id: OriginId,
 		/// Block number after which this proposal expires
 		pub expiry_at: Option<BlockNumber>,
 		/// List of approvals of a proposal as (AccountId, OriginId) pairs
@@ -1984,6 +2271,8 @@ pub mod pallet {
 		pub executed_at: Option<BlockNumber>,
 		/// Whether proposal should auto-execute when it reaches `RequiredApprovalsCount`
 		pub auto_execute: Option<bool>,
+		/// Whether this proposal was executed by a collective
+		pub is_collective: Option<bool>,
 	}
 
 	/// Storage for proposals
@@ -2013,8 +2302,8 @@ pub mod pallet {
 		Blake2_128Concat,
 		(T::Hash, T::OriginId), // e.g. (proposal_hash, proposal_origin_id)
 		Blake2_128Concat,
-		T::OriginId,  // e.g. approving_origin_id or withdrawing_origin_id
-		T::AccountId, // e.g. account that added the approval
+		T::OriginId,          // e.g. approving_origin_id or withdrawing_origin_id
+		(T::AccountId, bool), // e.g. account that added the approval and is_collective flag
 		OptionQuery,
 	>;
 
@@ -2044,10 +2333,23 @@ pub mod pallet {
 		ValueQuery,
 	>;
 
+	/// Storage for withdrawn approvals
+	/// Key: (proposal_hash, proposal_origin_id, approving_origin_id)
+	/// Value: (account_id, is_collective, block_number)
+	#[pallet::storage]
+	#[pallet::getter(fn withdrawn_approvals)]
+	pub type WithdrawnApprovals<T: Config> = StorageMap<
+		_,
+		Blake2_128Concat,
+		(T::Hash, T::OriginId, T::OriginId),
+		Vec<(T::AccountId, bool, BlockNumberFor<T>)>,
+		OptionQuery,
+	>;
+
 	/// Storage for governance-related hashes including remarks and storage identifiers.
 	/// Maps a proposal hash to a tuple containing:
 	/// 1. Combined hash of all remarks
-	/// 2. Individual remark hashes with their content
+	/// 2. Individual remark hashes with their content and metadata
 	/// 3. Storage identifiers (e.g. IPFS CIDs) with metadata
 	#[pallet::storage]
 	#[pallet::getter(fn governance_hashes)]
@@ -2057,7 +2359,18 @@ pub mod pallet {
 		T::Hash,
 		(
 			T::Hash, // Combined hash of all remarks
-			BoundedBTreeMap<T::Hash, BoundedVec<u8, T::MaxRemarkLength>, T::MaxRemarksPerProposal>, /* Individual remark hashes */
+			BoundedBTreeMap<
+				T::Hash,
+				(
+					BoundedVec<u8, T::MaxRemarkLength>, // The remark content
+					T::AccountId,                       // Proposer account
+					T::OriginId,                        // Proposal origin ID
+					Option<T::OriginId>,                // Approving origin ID (if applicable)
+					bool,                               // Is collective
+					BlockNumberFor<T>,                  // Block when remark was added
+				),
+				T::MaxRemarksPerProposal,
+			>, // Individual remark hashes with metadata
 			BoundedVec<
 				(
 					BoundedVec<u8, T::MaxStorageIdLength>, // Storage ID (e.g. IPFS CID)

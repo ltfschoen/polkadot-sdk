@@ -46,6 +46,7 @@ impl Default for CustomOriginType {
 	}
 }
 
+pub const ROOT: AccountId = 0;
 pub const ALICE: AccountId = 1;
 pub const BOB: AccountId = 2;
 pub const CHARLIE: AccountId = 3;
@@ -55,6 +56,8 @@ pub const ROOT_ORIGIN_ID: CompositeOriginId = CompositeOriginId { collective_id:
 pub const ALICE_ORIGIN_ID: CompositeOriginId = CompositeOriginId { collective_id: 1, role: 0 };
 pub const BOB_ORIGIN_ID: CompositeOriginId = CompositeOriginId { collective_id: 2, role: 0 };
 pub const CHARLIE_ORIGIN_ID: CompositeOriginId = CompositeOriginId { collective_id: 3, role: 0 };
+pub const TECH_FELLOWSHIP_ORIGIN_ID: CompositeOriginId =
+	CompositeOriginId { collective_id: 4, role: 0 };
 
 // Custom origin checks if sender is Alice
 pub struct AliceOrigin;
@@ -222,10 +225,32 @@ impl EnsureOrigin<RuntimeOrigin> for MockReferendaOrigin {
 	}
 }
 
+// Mock for Technical Fellowship integration
+pub struct MockTechnicaFellowshipOrigin;
+
+impl EnsureOrigin<RuntimeOrigin> for MockTechnicaFellowshipOrigin {
+	type Success = AccountId;
+
+	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
+		match o.clone().into() {
+			Ok(frame_system::RawOrigin::Signed(ref who)) if who == &ALICE => {
+				// Only Alice can act as the Technical Fellowship
+				Ok(who.clone())
+			},
+			_ => Err(o),
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn try_successful_origin() -> Result<RuntimeOrigin, ()> {
+		Ok(frame_system::RawOrigin::Signed(ALICE).into())
+	}
+}
+
 // Combined origin type for testing both collective and OpenGov origins
 pub type TestCollectiveOrigin = frame_support::traits::EitherOfDiverse<
 	frame_system::EnsureRoot<AccountId>,
-	MockReferendaOrigin,
+	frame_support::traits::EitherOfDiverse<MockReferendaOrigin, MockTechnicaFellowshipOrigin>,
 >;
 
 impl pallet_origin_and_gate::Config for Test {
