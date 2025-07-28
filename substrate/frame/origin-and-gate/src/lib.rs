@@ -110,6 +110,9 @@ pub use weights::*;
 #[cfg(feature = "runtime-benchmarks")]
 pub mod benchmarking;
 
+pub mod collective_metadata;
+pub use collective_metadata::*;
+
 /// Timepoint represents a specific moment (block number and extrinsic index).
 #[derive(
 	Clone, Eq, PartialEq, Encode, Decode, Default, RuntimeDebug, MaxEncodedLen, TypeInfo, Copy,
@@ -373,6 +376,7 @@ pub mod pallet {
 				Error::RemarkNotFound => 21,
 				Error::TooManyRemarks => 22,
 				Error::WithdrawnApprovalNotFound => 23,
+				Error::CollectiveNotAuthorized => 24,
 			}
 		}
 
@@ -678,8 +682,8 @@ pub mod pallet {
 					who.clone(),
 					proposal_hash,
 					proposal_origin_id.clone(),
-					id.clone(),
-					storage_id_description.clone(),
+					id,
+					storage_id_description,
 				)?;
 
 				// Emit event for the storage ID addition
@@ -689,6 +693,7 @@ pub mod pallet {
 					account_id: who.clone(),
 					storage_id: id,
 					storage_id_description,
+					is_collective: false,
 				});
 			}
 
@@ -773,7 +778,8 @@ pub mod pallet {
 			proposal_origin_id: T::OriginId,
 			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
 			storage_id_description: Option<BoundedVec<u8, T::MaxStorageIdDescriptionLength>>,
-		) -> DispatchResult {
+			is_collective: bool,
+		) -> DispatchResultWithPostInfo {
 			// Check proposal exists
 			ensure!(
 				<Proposals<T>>::contains_key(proposal_hash, proposal_origin_id),
@@ -821,9 +827,10 @@ pub mod pallet {
 				account_id: who,
 				storage_id,
 				storage_id_description,
+				is_collective,
 			});
 
-			Ok(())
+			Ok(().into())
 		}
 
 		/// Helper function to remove a storage identifier from a proposal
@@ -1042,10 +1049,10 @@ pub mod pallet {
 		/// - Boolean whether origin is collective origin
 		pub fn ensure_signed_or_collective(
 			origin: OriginFor<T>,
-		) -> Result<(T::AccountId, bool), DispatchError> {
+		) -> Result<(T::AccountId, bool, Option<u32>), DispatchError> {
 			// Try to extract a signed origin
 			match ensure_signed(origin.clone()) {
-				Ok(who) => Ok((who, false)),
+				Ok(who) => Ok((who, false, None)),
 				Err(_) => {
 					// Not signed origin so try collective origin
 					match T::CollectiveOrigin::try_origin(origin.clone()) {
@@ -1074,7 +1081,7 @@ pub mod pallet {
 										})
 									});
 
-									Ok((account_id, true))
+									Ok((account_id, true, Some(0)))
 								} else if let Ok(_) = frame_system::ensure_none(origin.clone()) {
 									// None origin is being treated as a special case for
 									// TECH_FELLOWSHIP collective origin
@@ -1090,7 +1097,7 @@ pub mod pallet {
 											panic!("Infinite length input; no invalid inputs for type; qed")
 										})
 									});
-									return Ok((account_id, true));
+									return Ok((account_id, true, Some(4)));
 								} else {
 									// Not a root origin so return an error for unexpected
 									// collective origin
@@ -1110,13 +1117,82 @@ pub mod pallet {
 									panic!("Infinite length input; no invalid inputs for type; qed")
 								});
 
-								Ok((account_id, true))
+								Ok((account_id, true, None))
 							}
 						},
 						Err(_) => Err(DispatchError::BadOrigin),
 					}
 				},
 			}
+		}
+
+		/// Helper function to check if a collective origin is whitelisted
+		fn is_whitelisted_collective(who: &T::AccountId) -> bool {
+			// Check if the account ID is the zero address (ROOT)
+			who == &T::AccountId::decode(
+				&mut sp_runtime::traits::TrailingZeroInput::zeroes(),
+			)
+			.unwrap_or_else(|_| {
+				panic!("Infinite length input; no invalid inputs for type; qed")
+			})
+		}
+
+		/// Helper function to add a storage identifier to a proposal from a collective origin
+		fn attach_storage_id_to_proposal_from_collective(
+			proposal_hash: T::Hash,
+			proposal_origin_id: T::OriginId,
+			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
+			storage_id_description: Option<BoundedVec<u8, T::MaxStorageIdDescriptionLength>>,
+			is_collective: bool,
+		) -> DispatchResult {
+			// Add or update the storage ID in GovernanceHashes
+			<GovernanceHashes<T>>::try_mutate(proposal_hash, |maybe_hashes| -> DispatchResult {
+				let hashes = maybe_hashes.get_or_insert((
+					<T as frame_system::Config>::Hashing::hash_of(&[0u8]), // Default combined hash
+					BoundedBTreeMap::new(),                                // Empty remark hashes
+					BoundedVec::default(),                                 // Empty storage IDs
+				));
+
+				// Check if the storage ID already exists
+				if hashes.2.iter().any(|(id, _, _, _)| id == &storage_id) {
+					return Err(Error::<T>::StorageIdAlreadyPresent.into());
+				}
+
+				// Add the new storage ID with metadata
+				hashes
+					.2
+					.try_push((
+						storage_id.clone(),
+						frame_system::Pallet::<T>::block_number(),
+						T::AccountId::decode(
+							&mut sp_runtime::traits::TrailingZeroInput::zeroes(),
+						)
+						.unwrap_or_else(|_| {
+							panic!("Infinite length input; no invalid inputs for type; qed")
+						}),
+						storage_id_description.clone(),
+					))
+					.map_err(|_| Error::<T>::TooManyStorageIds)?;
+
+				Ok(())
+			})?;
+
+			// Emit event for the storage ID addition
+			Self::deposit_event(Event::StorageIdAdded {
+				proposal_hash,
+				proposal_origin_id,
+				account_id: T::AccountId::decode(
+					&mut sp_runtime::traits::TrailingZeroInput::zeroes(),
+				)
+				.unwrap_or_else(|_| {
+					panic!("Infinite length input; no invalid inputs for type; qed")
+				}),
+				storage_id,
+				storage_id_description,
+				is_collective,
+			});
+
+			Ok(())
 		}
 	}
 
@@ -1130,7 +1206,7 @@ pub mod pallet {
 		/// Optionally including a storage ID (e.g. IPFS CID) and description
 		/// Optionally flagging to auto-execute the proposal when required approvals are reached
 		///
-		/// The dispatch origin for this call must be _Signed_.
+		/// The dispatch origin for this call must be _Signed_ or a valid collective origin.
 		///
 		/// Parameters:
 		/// - `call`: The call to be executed.
@@ -1155,8 +1231,19 @@ pub mod pallet {
 			storage_id_description: Option<Vec<u8>>,
 			auto_execute: Option<bool>,
 		) -> DispatchResultWithPostInfo {
-			// Check extrinsic was signed
-			let who = ensure_signed(origin)?;
+			// Check extrinsic origin - support both signed and collective origins
+			let (who, is_collective, collective_id) = Self::ensure_signed_or_collective(origin)?;
+
+			// Check if this collective has permission to execute this call index (0 for propose)
+			if is_collective {
+				if let Some(cid) = collective_id {
+					ensure!(
+						collective_metadata::helpers::collective_can_execute_call(cid, 0),
+						Error::<T>::CollectiveNotAuthorized
+					);
+				}
+			}
+
 			let current_block = <frame_system::Pallet<T>>::block_number();
 			let submission_timepoint = Self::current_timepoint();
 
@@ -1233,7 +1320,11 @@ pub mod pallet {
 			};
 
 			// Store proposal metadata (bounded storage)
-			<Proposals<T>>::insert(unique_proposal_hash, proposal_origin_id.clone(), proposal_info);
+			<Proposals<T>>::insert(
+				unique_proposal_hash,
+				proposal_origin_id.clone(),
+				proposal_info,
+			);
 
 			// Mark first approval in approvals storage efficiently only if proposer approval is
 			// included
@@ -1267,14 +1358,26 @@ pub mod pallet {
 					submission_timepoint,
 					None,
 					None,
-				);
+				)?;
 			}
 
-			// Emit event
+			// If a storage ID is provided then attach it to the proposal
+			if let Some(id) = bounded_storage_id {
+				Self::attach_storage_id_to_proposal(
+					who.clone(),
+					unique_proposal_hash,
+					proposal_origin_id.clone(),
+					id,
+					bounded_storage_id_description,
+					is_collective,
+				)?;
+			}
+
+			// Emit event for proposal creation
 			Self::deposit_event(Event::ProposalCreated {
 				proposal_hash: unique_proposal_hash,
 				proposal_origin_id,
-				proposal_account_id: who.clone(),
+				proposer: who,
 				timepoint: submission_timepoint,
 			});
 
@@ -1285,6 +1388,8 @@ pub mod pallet {
 		///
 		/// Optionally includes a remark that will be published on-chain
 		/// and associated with this approval.
+		///
+		/// The dispatch origin for this call must be _Signed_ or a valid collective origin.
 		///
 		/// Parameters:
 		/// - `proposal_hash`: Proposal hash to approve.
@@ -1304,7 +1409,17 @@ pub mod pallet {
 			storage_id: Option<Vec<u8>>,
 			storage_id_description: Option<Vec<u8>>,
 		) -> DispatchResultWithPostInfo {
-			let who = ensure_signed(origin)?;
+			let (who, is_collective, collective_id) = Self::ensure_signed_or_collective(origin)?;
+
+			// Check if this collective has permission to execute this call index (1 for add_approval)
+			if is_collective {
+				if let Some(cid) = collective_id {
+					ensure!(
+						collective_metadata::helpers::collective_can_execute_call(cid, 1),
+						Error::<T>::CollectiveNotAuthorized
+					);
+				}
+			}
 
 			let approval_timepoint = Self::current_timepoint();
 
@@ -1315,9 +1430,23 @@ pub mod pallet {
 			let mut proposal_info = <Proposals<T>>::get(&proposal_hash, &proposal_origin_id)
 				.ok_or(Error::<T>::ProposalNotFound)?;
 
-			// Check if caller is same as proposer of proposal but using a different origin ID
-			if who == proposal_info.proposer && approving_origin_id != proposal_origin_id {
-				return Err(Error::<T>::CannotApproveOwnProposalUsingDifferentOrigin.into());
+			// For non-whitelisted collectives, ensure they follow the same rules as signed origins
+			if is_collective {
+				if let Some(cid) = collective_id {
+					if !collective_metadata::helpers::is_whitelisted_collective(cid) {
+						// Check if caller is same as proposer of proposal but using a different origin ID
+						if who == proposal_info.proposer && approving_origin_id != proposal_origin_id {
+							return Err(Error::<T>::CannotApproveOwnProposalUsingDifferentOrigin.into());
+						}
+					}
+					// Whitelisted collectives can approve any proposal
+				}
+			} else {
+				// Standard signed origin checks
+				// Check if caller is same as proposer of proposal but using a different origin ID
+				if who == proposal_info.proposer && approving_origin_id != proposal_origin_id {
+					return Err(Error::<T>::CannotApproveOwnProposalUsingDifferentOrigin.into());
+				}
 			}
 
 			// Check if proposal still pending
@@ -1334,10 +1463,12 @@ pub mod pallet {
 				return Err(Error::<T>::ProposalExpired.into());
 			}
 
-			// Ensure approver is not the original proposer with a different origin ID
-			// This prevents the same user from approving their own proposal with a different origin
-			if proposal_info.proposer == who && proposal_origin_id != approving_origin_id {
-				return Err(Error::<T>::CannotApproveOwnProposalUsingDifferentOrigin.into());
+			// For non-whitelisted collectives and signed origins, ensure approver is not the original proposer with a different origin ID
+			if !is_collective || (is_collective && collective_id.map_or(false, |cid| !collective_metadata::helpers::is_whitelisted_collective(cid))) {
+				// This prevents the same user from approving their own proposal with a different origin
+				if proposal_info.proposer == who && proposal_origin_id != approving_origin_id {
+					return Err(Error::<T>::CannotApproveOwnProposalUsingDifferentOrigin.into());
+				}
 			}
 
 			// Ensure origin has not already approved
@@ -1382,7 +1513,19 @@ pub mod pallet {
 					approval_timepoint,
 					Some(approving_origin_id.clone()),
 					Some(who.clone()),
-				);
+				)?;
+			}
+
+			// If storage ID is provided, attach it to the proposal
+			if let Some(bounded_id) = bounded_storage_id {
+				Self::attach_storage_id_to_proposal(
+					proposal_hash,
+					proposal_origin_id.clone(),
+					bounded_id,
+					bounded_storage_id_description,
+					who.clone(),
+					is_collective,
+				)?;
 			}
 
 			// Emit standard approval added event
@@ -1392,6 +1535,7 @@ pub mod pallet {
 				approving_origin_id: approving_origin_id.clone(),
 				approving_account_id: who.clone(),
 				timepoint: approval_timepoint,
+				is_collective,
 			});
 
 			// Check if proposal can be executed now and auto-execute if requested
@@ -1423,27 +1567,23 @@ pub mod pallet {
 									return Err(Error::<T>::ProposalNotFound.into());
 								}
 
-								// Propagate all errors except `InsufficientApprovals` error
+								// Propagate all errors except InsufficientApprovals which is
+								// expected
 								if module_error.error[0] != insufficient_approvals_index {
-									return Err(DispatchError::Module(module_error).into());
-								} else {
-									// Otherwise silently ignore InsufficientApprovals error
-									return Ok(().into());
+									return Err(e.error);
 								}
 							} else {
-								// Error from another pallet must always be propagated
-								return Err(DispatchError::Module(module_error).into());
+								// Not from our pallet so propagate
+								return Err(e.error);
 							}
 						},
-						// Non-module errors must always be propagated
-						_ => {
-							return Err(e.error.into());
-						},
+						// Not a module error so propagate
+						_ => return Err(e.error),
 					},
 				}
-			} else {
-				Ok(().into())
 			}
+
+			Ok(().into())
 		}
 
 		/// Amend an existing proposal or approval with an additional remark and optionally add a
@@ -1531,7 +1671,7 @@ pub mod pallet {
 				update_timepoint,
 				approving_origin_id,
 				Some(who),
-			);
+			)?;
 
 			Ok(().into())
 		}
@@ -1561,7 +1701,7 @@ pub mod pallet {
 			Ok(().into())
 		}
 
-		/// Cancel pending proposal is only callable by original proposer
+		/// Cancel pending proposal is only callable by original proposer or authorized collective
 		#[pallet::call_index(4)]
 		#[pallet::weight(<T as pallet::Config>::WeightInfo::cancel_proposal())]
 		pub fn cancel_proposal(
@@ -1569,8 +1709,18 @@ pub mod pallet {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
 		) -> DispatchResultWithPostInfo {
-			// Check extrinsic was signed
-			let who = ensure_signed(origin)?;
+			// Check extrinsic was signed or from collective
+			let (who, is_collective, collective_id) = Self::ensure_signed_or_collective(origin)?;
+
+			// Check if this collective has permission to execute this call index (4 for cancel_proposal)
+			if is_collective {
+				if let Some(cid) = collective_id {
+					ensure!(
+						collective_metadata::helpers::collective_can_execute_call(cid, 4),
+						Error::<T>::CollectiveNotAuthorized
+					);
+				}
+			}
 
 			// Get proposal info
 			let mut proposal_info = Proposals::<T>::get(&proposal_hash, &proposal_origin_id)
@@ -1587,8 +1737,20 @@ pub mod pallet {
 				Error::<T>::ProposalNotPending
 			);
 
-			// Ensure caller is original proposer
-			ensure!(who == proposal_info.proposer, Error::<T>::NotAuthorized);
+			// For collective origins, check if they have elevated privileges
+			if is_collective {
+				if let Some(cid) = collective_id {
+					// Whitelisted collectives can cancel any proposal
+					if !collective_metadata::helpers::is_whitelisted_collective(cid) {
+						// Non-whitelisted collectives can only cancel proposals they created
+						ensure!(who == proposal_info.proposer, Error::<T>::NotAuthorized);
+					}
+					// Whitelisted collectives can cancel any proposal without additional checks
+				}
+			} else {
+				// Standard signed origin check - ensure caller is original proposer
+				ensure!(who == proposal_info.proposer, Error::<T>::NotAuthorized);
+			}
 
 			// Update proposal status to Cancelled
 			proposal_info.status = ProposalStatus::Cancelled;
@@ -1597,7 +1759,11 @@ pub mod pallet {
 			let expiry_at = proposal_info.expiry_at;
 
 			// Update storage with cancelled status
-			<Proposals<T>>::insert(&proposal_hash, &proposal_origin_id, proposal_info);
+			<Proposals<T>>::insert(
+				proposal_hash,
+				proposal_origin_id.clone(),
+				proposal_info,
+			);
 
 			// Clean up all storage related to the proposal
 			Self::remove_proposal_storage(proposal_hash, proposal_origin_id.clone());
@@ -1619,6 +1785,7 @@ pub mod pallet {
 				proposal_hash,
 				proposal_origin_id,
 				timepoint: cancellation_timepoint,
+				is_collective,
 			});
 
 			Ok(().into())
@@ -1642,7 +1809,17 @@ pub mod pallet {
 			proposal_origin_id: T::OriginId,
 			withdrawing_origin_id: T::OriginId,
 		) -> DispatchResultWithPostInfo {
-			let who = ensure_signed(origin)?;
+			let (who, is_collective, collective_id) = Self::ensure_signed_or_collective(origin)?;
+
+			// Check if this collective has permission to execute this call index (5 for withdraw_approval)
+			if is_collective {
+				if let Some(cid) = collective_id {
+					ensure!(
+						collective_metadata::helpers::collective_can_execute_call(cid, 5),
+						Error::<T>::CollectiveNotAuthorized
+					);
+				}
+			}
 
 			// Get proposal info
 			let mut proposal = <Proposals<T>>::get(&proposal_hash, &proposal_origin_id)
@@ -1665,7 +1842,18 @@ pub mod pallet {
 			)
 			.ok_or(Error::<T>::AccountOriginApprovalNotFound)?;
 
-			ensure!(approving_account_id == who, Error::<T>::NotAuthorized);
+			// For regular signed origins, ensure caller is original approver
+			// For collective origins, whitelisted collectives can withdraw any approval,
+			// while non-whitelisted collectives can only withdraw their own approvals
+			if !is_collective {
+				ensure!(approving_account_id == who, Error::<T>::NotAuthorized);
+			} else if let Some(cid) = collective_id {
+				if !collective_metadata::helpers::is_whitelisted_collective(cid) {
+					// Non-whitelisted collectives can only withdraw their own approvals
+					ensure!(approving_account_id == who, Error::<T>::NotAuthorized);
+				}
+				// Whitelisted collectives can withdraw any approval (no additional check needed)
+			}
 
 			// Find position of withdrawing_origin_id in approvals vector
 			let pos = proposal
@@ -1678,7 +1866,11 @@ pub mod pallet {
 			proposal.approvals.swap_remove(pos);
 
 			// Update proposal in storage
-			<Proposals<T>>::insert(&proposal_hash, &proposal_origin_id, &proposal);
+			<Proposals<T>>::insert(
+				proposal_hash,
+				proposal_origin_id.clone(),
+				proposal.clone(),
+			);
 
 			// Remove approval from Approvals storage
 			<Approvals<T>>::remove((proposal_hash, proposal_origin_id), withdrawing_origin_id);
@@ -1773,6 +1965,7 @@ pub mod pallet {
 				proposal_hash,
 				proposal_origin_id,
 				timepoint: cleanup_timepoint,
+				is_collective: false,
 			});
 
 			Ok(().into())
@@ -1781,8 +1974,10 @@ pub mod pallet {
 		/// Add a storage identifier to a proposal.
 		///
 		/// Supports IPFS CIDs and other storage identifiers.
-		/// Dispatch origin for this call must be signed by proposer or an approver of the proposal.
-		/// No other accounts are authorized to add storage IDs.
+		/// Can be called by:
+		/// - The original proposer
+		/// - An approver of the proposal
+		/// - A whitelisted collective origin (e.g., Technical Fellowship)
 		///
 		/// Parameters:
 		/// - `proposal_hash`: The hash of the proposal to add the storage ID to.
@@ -1798,20 +1993,48 @@ pub mod pallet {
 			storage_id: Vec<u8>,
 			storage_id_description: Option<Vec<u8>>,
 		) -> DispatchResultWithPostInfo {
-			let who = ensure_signed(origin)?;
+			// Check extrinsic origin - support both signed and collective origins
+			let (who, is_collective, collective_id) = Self::ensure_signed_or_collective(origin)?;
+
+			// Check if this collective has permission to execute this call index (8 for add_storage_id)
+			if is_collective {
+				if let Some(cid) = collective_id {
+					ensure!(
+						collective_metadata::helpers::collective_can_execute_call(cid, 8),
+						Error::<T>::CollectiveNotAuthorized
+					);
+				}
+			}
 
 			let (bounded_storage_id, bounded_storage_id_description) =
 				Self::convert_to_bounded_types(Some(storage_id), storage_id_description)?;
 
-			Self::attach_storage_id_to_proposal(
-				who,
-				proposal_hash,
-				proposal_origin_id,
-				bounded_storage_id.unwrap(),
-				bounded_storage_id_description,
-			)?;
+			// If origin is a whitelisted collective, allow adding storage ID without further checks
+			let is_whitelisted = is_collective &&
+				collective_id.map_or(false, |cid| collective_metadata::helpers::is_whitelisted_collective(cid));
 
-			// Event is emitted in attach_storage_id_to_proposal
+			if is_whitelisted {
+				// Whitelisted collective can add storage ID directly
+				Self::attach_storage_id_to_proposal_from_collective(
+					proposal_hash,
+					proposal_origin_id,
+					bounded_storage_id.unwrap(),
+					bounded_storage_id_description,
+					is_collective,
+				)?;
+			} else {
+				// For regular signed origins, use the existing flow that checks if caller is proposer or approver
+				Self::attach_storage_id_to_proposal(
+					who,
+					proposal_hash,
+					proposal_origin_id,
+					bounded_storage_id.unwrap(),
+					bounded_storage_id_description,
+					is_collective,
+				)?;
+			}
+
+			// Event is emitted in the helper functions
 
 			Ok(().into())
 		}
@@ -1835,48 +2058,68 @@ pub mod pallet {
 			proposal_origin_id: T::OriginId,
 			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
 		) -> DispatchResultWithPostInfo {
-			let (who, is_collective) = Self::ensure_signed_or_collective(origin.clone())?;
+			let (who, is_collective, collective_id) = Self::ensure_signed_or_collective(origin)?;
 
+			// Check if this collective has permission to execute this call index (9 for remove_storage_id)
 			if is_collective {
-				// Test mode only
-				//
-				// Ensure the origin is the root or a collective origin
-				// Return BadOrigin if origin does not match proposal_origin_id
-				#[cfg(test)]
-				{
-					// Check if the proposal_origin_id is valid for a collective origin
-					// Since we cannot directly compare T::OriginId with CompositeOriginId constants
-					// we instead extract and check the collective_id values.
-
-					// Get the collective_id from proposal_origin_id
-					// where T::OriginId in tests is CompositeOriginId or convertable to u64
-					let origin_id_bytes = codec::Encode::encode(&proposal_origin_id);
-					let origin_id_u64 = u64::decode(&mut &origin_id_bytes[..])
-						.map_err(|_| sp_runtime::traits::BadOrigin)?;
-
-					// Check if it is ROOT (collective_id 0) or TECH_FELLOWSHIP (collective_id 4)
-					// CompositeOriginId is encoded with collective_id as the first 32 bits
-					let collective_id = (origin_id_u64 >> 32) as u32;
-
+				if let Some(cid) = collective_id {
 					ensure!(
-						collective_id == 0 || collective_id == 4,
-						sp_runtime::traits::BadOrigin
+						collective_metadata::helpers::collective_can_execute_call(cid, 9),
+						Error::<T>::CollectiveNotAuthorized
 					);
 				}
+			}
 
-				T::CollectiveOrigin::ensure_origin(origin)?;
-				// Collective origins do not need check if proposal exists with proposal_origin_id
-				// instead we just check if storage ID exists and remove it
+			if is_collective {
+				// Find the storage ID and its adder
+				let mut storage_id_adder: Option<T::AccountId> = None;
+				<GovernanceHashes<T>>::try_mutate(
+					proposal_hash,
+					|maybe_hashes| -> DispatchResult {
+						if let Some(hashes) = maybe_hashes {
+							let (_, _, ids) = hashes;
+							if let Some(idx) = ids.iter().position(|(id, _, adder, _)| id == &storage_id) {
+								// Store the adder for permission check
+								storage_id_adder = Some(ids[idx].2.clone());
+							}
+						}
+						Ok(())
+					},
+				)?;
+
+				// Check if the collective has permission to remove this storage ID
+				if let Some(cid) = collective_id {
+					if !collective_metadata::helpers::is_whitelisted_collective(cid) {
+						// Non-whitelisted collectives can only remove storage IDs they added
+						if let Some(adder) = storage_id_adder {
+							let collective_account_bytes = codec::Encode::encode(&who);
+							let adder_bytes = codec::Encode::encode(&adder);
+
+							ensure!(
+								collective_metadata::helpers::collective_can_remove_storage_id(
+									cid,
+									&adder_bytes,
+									&collective_account_bytes
+								),
+								Error::<T>::NotAuthorized
+							);
+						} else {
+							// Storage ID not found or no adder information
+							return Err(Error::<T>::ProposalStorageIdNotFound.into());
+						}
+					}
+					// Whitelisted collectives can remove any storage ID (no additional check needed)
+				}
+
+				// Remove the storage ID
 				let mut found = false;
 				<GovernanceHashes<T>>::try_mutate(
 					proposal_hash,
 					|maybe_hashes| -> DispatchResult {
 						if let Some(hashes) = maybe_hashes {
 							let (_, _, ids) = hashes;
-							if let Some(idx) =
-								ids.iter().position(|(id, _, _, _)| id == &storage_id)
-							{
-								// Remove the storage ID
+							if let Some(idx) = ids.iter().position(|(id, _, _, _)| id == &storage_id) {
+								// Remove storage ID
 								ids.remove(idx);
 								found = true;
 							}
@@ -1894,37 +2137,9 @@ pub mod pallet {
 					proposal_origin_id,
 					account_id: who,
 					storage_id,
-					is_collective: true,
+					is_collective,
 				});
-			} else if let Ok(who) = ensure_signed(origin) {
-				#[cfg(test)]
-				{
-					// Test mode only
-					//
-					// Relates to test
-					// 'remove_storage_id_with_collective_fails_for_unauthorized_origin'
-					// Check if signed origin is trying to use a collective origin ID
-					let origin_id_bytes = codec::Encode::encode(&proposal_origin_id);
-
-					// Check the collective_id (first 4 bytes) for CompositeOriginId
-					if origin_id_bytes.len() >= 4 {
-						let collective_id = u32::from_le_bytes([
-							origin_id_bytes[0],
-							origin_id_bytes[1],
-							origin_id_bytes[2],
-							origin_id_bytes[3],
-						]);
-
-						// Signed origins cannot use collective origin IDs
-						// so if it is ROOT (0) or TECH_FELLOWSHIP (4) then return BadOrigin
-						if (collective_id == 0 || collective_id == 4) &&
-							<Proposals<T>>::contains_key(proposal_hash, &proposal_origin_id)
-						{
-							return Err(sp_runtime::traits::BadOrigin.into());
-						}
-					}
-				}
-
+			} else {
 				// Signed origins
 				Self::detach_storage_id_from_proposal(
 					proposal_hash,
@@ -1932,9 +2147,6 @@ pub mod pallet {
 					storage_id,
 					who,
 				)?;
-			} else {
-				// Neither a valid collective origin nor a signed origin
-				return Err(sp_runtime::traits::BadOrigin.into());
 			}
 
 			Ok(().into())
@@ -1947,6 +2159,20 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			remark: Vec<u8>,
 		) -> DispatchResultWithPostInfo {
+			// First try to handle as a collective origin
+			if let Ok((who, is_collective, collective_id)) = Self::ensure_signed_or_collective(origin.clone()) {
+				if is_collective {
+					if let Some(cid) = collective_id {
+						ensure!(
+							collective_metadata::helpers::collective_can_execute_call(cid, 10),
+							Error::<T>::CollectiveNotAuthorized
+						);
+					}
+					return Ok(().into());
+				}
+			}
+
+			// Fall back to the original behavior for signed origins
 			ensure_signed(origin)?;
 			Ok(().into())
 		}
@@ -1969,6 +2195,7 @@ pub mod pallet {
 			approving_origin_id: T::OriginId,
 			approving_account_id: T::AccountId,
 			timepoint: Timepoint<BlockNumberFor<T>>,
+			is_collective: bool,
 		},
 		/// A proposal has been created with a remark.
 		ProposalCreatedWithRemark {
@@ -2013,6 +2240,7 @@ pub mod pallet {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
 			timepoint: Timepoint<BlockNumberFor<T>>,
+			is_collective: bool,
 		},
 		/// An origin has withdrawn their approval of a proposal.
 		OriginApprovalWithdrawn {
@@ -2030,6 +2258,7 @@ pub mod pallet {
 			proposal_hash: T::Hash,
 			proposal_origin_id: T::OriginId,
 			timepoint: Timepoint<BlockNumberFor<T>>,
+			is_collective: bool,
 		},
 		/// A duplicate proposal was detected but still created with a unique identifier.
 		/// Warns user that a similar proposal already exists.
@@ -2063,6 +2292,8 @@ pub mod pallet {
 			storage_id: BoundedVec<u8, T::MaxStorageIdLength>,
 			/// Optional storage ID description of the storage ID.
 			storage_id_description: Option<BoundedVec<u8, T::MaxStorageIdDescriptionLength>>,
+			/// Whether the storage ID was added by a collective origin.
+			is_collective: bool,
 		},
 		/// A storage ID has been removed from a proposal.
 		StorageIdRemoved {
@@ -2130,6 +2361,8 @@ pub mod pallet {
 		TooManyRemarks,
 		/// Withdrawn approval not found
 		WithdrawnApprovalNotFound,
+		/// Collective origin is not authorized to execute this call
+		CollectiveNotAuthorized,
 	}
 
 	/// Status of proposal

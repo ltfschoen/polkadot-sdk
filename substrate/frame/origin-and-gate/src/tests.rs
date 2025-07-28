@@ -3141,6 +3141,767 @@ mod unit_test {
 			});
 		}
 	}
+
+	mod collective_extrinsics {
+		use super::*;
+
+		mod add_approval {
+			use super::*;
+
+			#[test]
+			fn add_approval_with_tech_fellowship_collective_works() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Technical Fellowship adds approval
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+						None,
+					));
+
+					// Verify approval exists
+					assert!(OriginAndGate::has_approval(proposal_hash, TECH_FELLOWSHIP));
+
+					// Verify event emitted with is_collective flag
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ApprovalAdded {
+						proposal_hash,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+
+			#[test]
+			fn add_approval_with_society_collective_works() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Society adds approval
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::collective(SOCIETY),
+						proposal_hash,
+						SOCIETY,
+						None,
+					));
+
+					// Verify approval exists
+					assert!(OriginAndGate::has_approval(proposal_hash, SOCIETY));
+
+					// Verify event emitted with is_collective flag
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ApprovalAdded {
+						proposal_hash,
+						origin_id: SOCIETY,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+
+			#[test]
+			fn add_approval_event_includes_is_collective_flag() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Regular signed origin adds approval
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::signed(BOB),
+						proposal_hash,
+						BOB_ORIGIN_ID,
+						None,
+					));
+
+					// Verify event emitted with is_collective = false
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ApprovalAdded {
+						proposal_hash,
+						origin_id: BOB_ORIGIN_ID,
+						account_id: BOB,
+						is_collective: false,
+					}));
+
+					// Collective origin adds approval
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+						None,
+					));
+
+					// Verify event emitted with is_collective = true
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ApprovalAdded {
+						proposal_hash,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+		}
+
+		mod amend_remark {
+			use super::*;
+
+			#[test]
+			fn amend_remark_with_tech_fellowship_collective_works() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Technical Fellowship amends remark
+					let remark = b"Technical Fellowship remark".to_vec();
+					assert_ok!(OriginAndGate::amend_remark(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+						remark.clone(),
+					));
+
+					// Verify remark exists
+					assert_eq!(
+						OriginAndGate::proposal_remarks(proposal_hash, TECH_FELLOWSHIP),
+						Some(remark.clone().try_into().unwrap())
+					);
+
+					// Verify event emitted with is_collective flag
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::RemarkAmended {
+						proposal_hash,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						remark: remark.clone().try_into().unwrap(),
+						is_collective: true,
+					}));
+				});
+			}
+
+			#[test]
+			fn amend_remark_event_includes_is_collective_flag() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Regular signed origin amends remark
+					let remark1 = b"Alice remark".to_vec();
+					assert_ok!(OriginAndGate::amend_remark(
+						RuntimeOrigin::signed(ALICE),
+						proposal_hash,
+						ALICE_ORIGIN_ID,
+						remark1.clone(),
+					));
+
+					// Verify event emitted with is_collective = false
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::RemarkAmended {
+						proposal_hash,
+						origin_id: ALICE_ORIGIN_ID,
+						account_id: ALICE,
+						remark: remark1.clone().try_into().unwrap(),
+						is_collective: false,
+					}));
+
+					// Collective origin amends remark
+					let remark2 = b"Technical Fellowship remark".to_vec();
+					assert_ok!(OriginAndGate::amend_remark(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+						remark2.clone(),
+					));
+
+					// Verify event emitted with is_collective = true
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::RemarkAmended {
+						proposal_hash,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						remark: remark2.clone().try_into().unwrap(),
+						is_collective: true,
+					}));
+				});
+			}
+		}
+
+		mod execute_proposal {
+			use super::*;
+
+			#[test]
+			fn execute_proposal_with_tech_fellowship_collective_works() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Technical Fellowship adds approval
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+						None,
+					));
+
+					// Technical Fellowship executes proposal
+					assert_ok!(OriginAndGate::execute_proposal(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+					));
+
+					// Verify proposal is executed
+					let proposal = OriginAndGate::proposals(proposal_hash).unwrap();
+					assert_eq!(proposal.status, ProposalStatus::Executed);
+
+					// Verify event emitted with is_collective flag
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalExecuted {
+						proposal_hash,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+
+			#[test]
+			fn execute_proposal_event_includes_is_collective_flag() {
+				new_test_ext().execute_with(|| {
+					// Create two proposals
+					let call1 = create_dummy_call(1001);
+					let proposal_hash1 = BlakeTwo256::hash_of(&call1);
+
+					let call2 = create_dummy_call(1002);
+					let proposal_hash2 = BlakeTwo256::hash_of(&call2);
+
+					// Create proposals
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call1.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call2.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Add approvals
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::signed(BOB),
+						proposal_hash1,
+						BOB_ORIGIN_ID,
+						None,
+					));
+
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash2,
+						TECH_FELLOWSHIP,
+						None,
+					));
+
+					// Regular signed origin executes proposal
+					assert_ok!(OriginAndGate::execute_proposal(
+						RuntimeOrigin::signed(ALICE),
+						proposal_hash1,
+						ALICE_ORIGIN_ID,
+					));
+
+					// Verify event emitted with is_collective = false
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalExecuted {
+						proposal_hash: proposal_hash1,
+						origin_id: ALICE_ORIGIN_ID,
+						account_id: ALICE,
+						is_collective: false,
+					}));
+
+					// Collective origin executes proposal
+					assert_ok!(OriginAndGate::execute_proposal(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash2,
+						TECH_FELLOWSHIP,
+					));
+
+					// Verify event emitted with is_collective = true
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalExecuted {
+						proposal_hash: proposal_hash2,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+		}
+
+		mod cancel_proposal {
+			use super::*;
+
+			#[test]
+			fn cancel_proposal_with_tech_fellowship_collective_works() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Technical Fellowship cancels proposal
+					assert_ok!(OriginAndGate::cancel_proposal(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+					));
+
+					// Verify proposal is cancelled
+					let proposal = OriginAndGate::proposals(proposal_hash).unwrap();
+					assert_eq!(proposal.status, ProposalStatus::Cancelled);
+
+					// Verify event emitted with is_collective flag
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalCancelled {
+						proposal_hash,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+
+			#[test]
+			fn cancel_proposal_event_includes_is_collective_flag() {
+				new_test_ext().execute_with(|| {
+					// Create two proposals
+					let call1 = create_dummy_call(1001);
+					let proposal_hash1 = BlakeTwo256::hash_of(&call1);
+
+					let call2 = create_dummy_call(1002);
+					let proposal_hash2 = BlakeTwo256::hash_of(&call2);
+
+					// Create proposals
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call1.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(BOB),
+						call2.clone(),
+						BOB_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Regular signed origin cancels proposal
+					assert_ok!(OriginAndGate::cancel_proposal(
+						RuntimeOrigin::signed(ALICE),
+						proposal_hash1,
+						ALICE_ORIGIN_ID,
+					));
+
+					// Verify event emitted with is_collective = false
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalCancelled {
+						proposal_hash: proposal_hash1,
+						origin_id: ALICE_ORIGIN_ID,
+						account_id: ALICE,
+						is_collective: false,
+					}));
+
+					// Collective origin cancels proposal
+					assert_ok!(OriginAndGate::cancel_proposal(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash2,
+						TECH_FELLOWSHIP,
+					));
+
+					// Verify event emitted with is_collective = true
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalCancelled {
+						proposal_hash: proposal_hash2,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+		}
+
+		mod clean_proposals {
+			use super::*;
+
+			#[test]
+			fn clean_with_tech_fellowship_collective_works() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Execute the proposal
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::signed(BOB),
+						proposal_hash,
+						BOB_ORIGIN_ID,
+						None,
+					));
+
+					assert_ok!(OriginAndGate::execute_proposal(
+						RuntimeOrigin::signed(ALICE),
+						proposal_hash,
+						ALICE_ORIGIN_ID,
+					));
+
+					// Fast forward time to make proposal eligible for cleanup
+					let now = System::block_number();
+					System::set_block_number(now + 1000);
+
+					// Technical Fellowship cleans proposal
+					assert_ok!(OriginAndGate::clean(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+					));
+
+					// Verify proposal is cleaned
+					assert!(!OriginAndGate::proposal_exists(proposal_hash));
+
+					// Verify event emitted with is_collective flag
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalCleaned {
+						proposal_hash,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+
+			#[test]
+			fn clean_event_includes_is_collective_flag() {
+				new_test_ext().execute_with(|| {
+					// Create two proposals
+					let call1 = create_dummy_call(1001);
+					let proposal_hash1 = BlakeTwo256::hash_of(&call1);
+
+					let call2 = create_dummy_call(1002);
+					let proposal_hash2 = BlakeTwo256::hash_of(&call2);
+
+					// Create and execute proposals
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call1.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(BOB),
+						call2.clone(),
+						BOB_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Add approvals and execute
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::signed(BOB),
+						proposal_hash1,
+						BOB_ORIGIN_ID,
+						None,
+					));
+
+					assert_ok!(OriginAndGate::add_approval(
+						RuntimeOrigin::signed(ALICE),
+						proposal_hash2,
+						ALICE_ORIGIN_ID,
+						None,
+					));
+
+					assert_ok!(OriginAndGate::execute_proposal(
+						RuntimeOrigin::signed(ALICE),
+						proposal_hash1,
+						ALICE_ORIGIN_ID,
+					));
+
+					assert_ok!(OriginAndGate::execute_proposal(
+						RuntimeOrigin::signed(BOB),
+						proposal_hash2,
+						BOB_ORIGIN_ID,
+					));
+
+					// Fast forward time to make proposals eligible for cleanup
+					let now = System::block_number();
+					System::set_block_number(now + 1000);
+
+					// Regular signed origin cleans proposal
+					assert_ok!(OriginAndGate::clean(
+						RuntimeOrigin::signed(ALICE),
+						proposal_hash1,
+						ALICE_ORIGIN_ID,
+					));
+
+					// Verify event emitted with is_collective = false
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalCleaned {
+						proposal_hash: proposal_hash1,
+						origin_id: ALICE_ORIGIN_ID,
+						account_id: ALICE,
+						is_collective: false,
+					}));
+
+					// Collective origin cleans proposal
+					assert_ok!(OriginAndGate::clean(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash2,
+						TECH_FELLOWSHIP,
+					));
+
+					// Verify event emitted with is_collective = true
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::ProposalCleaned {
+						proposal_hash: proposal_hash2,
+						origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						is_collective: true,
+					}));
+				});
+			}
+		}
+
+		mod add_storage_id {
+			use super::*;
+
+			#[test]
+			fn add_storage_id_with_tech_fellowship_collective_works() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Create storage ID
+					let storage_id = create_test_storage_id(1);
+
+					// Technical Fellowship adds storage ID
+					assert_ok!(OriginAndGate::add_storage_id(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+						storage_id.clone().to_vec(),
+						None,
+					));
+
+					// Verify storage ID exists
+					assert!(OriginAndGate::has_storage_id_for_proposal(proposal_hash, &storage_id));
+
+					// Verify event emitted with is_collective flag
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::StorageIdAdded {
+						proposal_hash,
+						proposal_origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						storage_id: storage_id.clone(),
+						is_collective: true,
+					}));
+				});
+			}
+
+			#[test]
+			fn add_storage_id_event_includes_is_collective_flag() {
+				new_test_ext().execute_with(|| {
+					// Create a proposal
+					let call = create_dummy_call(1000);
+					let proposal_hash = BlakeTwo256::hash_of(&call);
+
+					assert_ok!(OriginAndGate::propose(
+						RuntimeOrigin::signed(ALICE),
+						call.clone(),
+						ALICE_ORIGIN_ID,
+						None,
+						None,
+						None,
+						None,
+						None,
+						Some(true),
+					));
+
+					// Create storage IDs
+					let storage_id1 = create_test_storage_id(1);
+					let storage_id2 = create_test_storage_id(2);
+
+					// Regular signed origin adds storage ID
+					assert_ok!(OriginAndGate::add_storage_id(
+						RuntimeOrigin::signed(ALICE),
+						proposal_hash,
+						ALICE_ORIGIN_ID,
+						storage_id1.clone().to_vec(),
+						None,
+					));
+
+					// Verify event emitted with is_collective = false
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::StorageIdAdded {
+						proposal_hash,
+						proposal_origin_id: ALICE_ORIGIN_ID,
+						account_id: ALICE,
+						storage_id: storage_id1.clone(),
+						is_collective: false,
+					}));
+
+					// Collective origin adds storage ID
+					assert_ok!(OriginAndGate::add_storage_id(
+						RuntimeOrigin::collective(TECH_FELLOWSHIP),
+						proposal_hash,
+						TECH_FELLOWSHIP,
+						storage_id2.clone().to_vec(),
+						None,
+					));
+
+					// Verify event emitted with is_collective = true
+					System::assert_has_event(RuntimeEvent::OriginAndGate(Event::StorageIdAdded {
+						proposal_hash,
+						proposal_origin_id: TECH_FELLOWSHIP,
+						account_id: ROOT,
+						storage_id: storage_id2.clone(),
+						is_collective: true,
+					}));
+				});
+			}
+		}
+	}
 }
 
 /// Integration tests for this pallet focusing on verifying end-to-end
